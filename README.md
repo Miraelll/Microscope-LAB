@@ -1,31 +1,26 @@
-<div align="center">
+# 🔬 Microscope LAB
 
-# 🔬 MicroscopeCamera
-
-### Turn your smartphone into a digital microscope camera.
-
-A Flutter application for capturing microscope images, adjusting the live preview, and saving annotated specimen photographs on **Android and iOS**.
+### Microscope photography and microcapsule counting on your phone: manual image controls, optical filters, automatic circle detection, diameters in μm, and a stamped, scaled result saved to your gallery.
 
 [![Flutter](https://img.shields.io/badge/Flutter-cross--platform-02569B?logo=flutter&logoColor=white)](https://flutter.dev/)
 [![Dart](https://img.shields.io/badge/Dart-3.13.5%2B-0175C2?logo=dart&logoColor=white)](https://dart.dev/)
 [![Platforms](https://img.shields.io/badge/platforms-Android%20%7C%20iOS-333333)](#platform-support)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-</div>
-
 ---
 
 ## Contents
 
 - [Overview](#overview)
+- [What's new](#whats-new)
 - [Features](#features)
+- [How capsule counting works](#how-capsule-counting-works)
+- [Scale ruler and diameters: read this first](#scale-ruler-and-diameters-read-this-first)
 - [Platform support](#platform-support)
-- [Screenshots](#screenshots)
 - [Getting started](#getting-started)
-- [Running the application](#running-the-application)
 - [Building a release](#building-a-release)
 - [How to use](#how-to-use)
-- [Image processing and annotations](#image-processing-and-annotations)
+- [The saved image](#the-saved-image)
 - [Project structure](#project-structure)
 - [Technology stack](#technology-stack)
 - [Permissions and privacy](#permissions-and-privacy)
@@ -36,129 +31,131 @@ A Flutter application for capturing microscope images, adjusting the live previe
 
 ## Overview
 
-**MicroscopeCamera** is a mobile microscope photography app built with Flutter. It provides a camera-focused workspace for observing specimens, adjusting the preview, and creating images with useful contextual annotations.
+**MicroscopeCamera** is a Flutter application for digital microscopy. Put a phone camera at the eyepiece or camera adapter of a microscope (or open an existing photo from the gallery), tune the image with exact numeric controls, choose an optical filter and a magnification, and let the app find round objects such as microcapsules, count them, and estimate their diameters in micrometres (μm).
 
-The app is designed for students, educators, hobbyists, and anyone who needs to document objects viewed through a microscope. A dark interface keeps attention on the image, while quick controls make it possible to tune the view and capture a specimen without leaving the camera screen.
+The result is saved as a PNG with the filter applied, every detected capsule outlined and numbered, a scale ruler, and an information stamp with the count and diameter statistics.
 
-The repository contains a shared Flutter codebase and platform folders for Android and iOS. The goal is to maintain one application experience across both mobile platforms.
+> **Note:** the app interface is currently in Russian.
 
-> **Important:** The magnification value is a user-selected label, and the scale bar is currently generated from that selection. Neither should be treated as a calibrated measurement unless the complete microscope and camera setup has been independently calibrated.
+> **Important:** diameters and the scale ruler are estimates derived from the selected magnification, not a calibrated measurement. See [Scale ruler and diameters: read this first](#scale-ruler-and-diameters-read-this-first).
+
+## What's new
+
+- **Automatic capsule detection and counting** with a circle Hough transform, running in a background isolate so the interface stays responsive.
+- **Multi-pass calculation:** run the detection over several brightness and sharpness values and get the average count, with the most representative pass applied.
+- **Diameters in μm** for every detected capsule, plus mean, minimum, and maximum in the stamp.
+- **Photo mode:** open any photo from the gallery and analyze it with the same tools as the live camera.
+- **Manual correction:** tap a capsule to remove it, tap an empty spot to add one.
+- **Spinbox controls** for brightness and sharpness (step 0.1), plus one-tap **auto-tuning**.
+- **Richer stamp** with capsule statistics, filter, settings, date, and a scale ruler.
 
 ## Features
 
-### Live microscope view
+### Live camera and photo mode
 
-- Live preview from the device camera.
-- Prefers the rear camera when available.
-- High-resolution camera capture using the Flutter camera plugin.
-- Portrait-oriented camera interface.
-- Tap the preview to set the focus and exposure point on supported devices.
+- Live preview from the rear camera (the first available camera is used if there is no rear one), portrait orientation.
+- Zoom within the range reported by the device, up to 8×.
+- Tap the preview to set focus and exposure; focus is then locked. Use the focus button to switch between locked and automatic focus.
+- Open an existing photo from the gallery and work with it exactly like a live frame; a button returns you to the live camera.
+- Reset button restores the default adjustments.
+
+Available ranges depend on the phone's camera hardware and operating system.
 
 ### Image controls
 
-- **Zoom:** adjust the camera zoom within the range reported by the device.
-- **Brightness:** tune the preview and captured image.
-- **Sharpness / contrast:** adjust the image appearance.
-- **Automatic tuning:** estimate suitable brightness and sharpness from a sample frame.
-- **Focus lock:** switch between automatic and locked focus where supported.
-- **Reset:** restore the default image adjustments and standard filter.
+- **Brightness:** spinbox from -10.0 to 10.0 in 0.1 steps. In live mode it also adjusts the camera exposure offset.
+- **Sharpness (contrast):** spinbox from 0.0 to 10.0 in 0.1 steps.
+- **Auto:** estimates brightness and sharpness from the central part of a sample frame.
 
-Actual camera capabilities depend on the phone, camera hardware, and operating-system implementation.
+Brightness and sharpness change how the image looks. They cannot recover detail the sensor did not capture.
 
-### Laboratory-style filters
+### Optical filters
 
-The app includes five preview and capture filters:
+| Filter           | Purpose                                                   |
+| ---------------- | --------------------------------------------------------- |
+| Standard         | Natural-looking baseline image                            |
+| High Detail (HD) | Increased contrast to emphasize visible edges             |
+| Clean White      | Cooler, slightly blue-toned image                         |
+| Achromat B/W     | Monochrome-style image                                    |
+| Dark Field       | Inverted, high-contrast appearance for visual exploration |
 
-| Filter | Purpose |
-|---|---|
-| Standard | Natural-looking baseline image |
-| High Detail (HD) | Increased contrast to emphasize visible edges |
-| Clean White | Cooler, slightly blue-toned image |
-| Achromat B/W | Monochrome-style image |
-| Dark Field | Inverted/high-contrast appearance for visual exploration |
+Filters apply to the preview, to capsule detection, and to the saved image. They are visual presets and do not replace real laboratory illumination.
 
-These are visual processing presets. They do not replace laboratory illumination techniques or scientific image analysis.
+### Capsule counting
 
-### Specimen labels and capture settings
+- **Count:** a single detection pass with the current brightness and sharpness.
+- **Multi-pass:** enter several brightness and sharpness values separated by spaces (defaults: `-0.5 0.0 0.5 1.0` and `1.0 2.0 3.0`), or fill them around the current values (±0.5). The app reports the average count across all passes.
+- **Detection settings:** minimum and maximum capsule radius in pixels, and edge sensitivity.
+- **Overlay:** detected capsules are outlined and numbered on screen and in the saved image.
+- **Manual edit:** turn on edit mode to remove false detections or add missed capsules by tapping.
 
-- Add a specimen or substance name, such as `NaCl crystal` or `Blood sample`.
-- Select a magnification label from the built-in list: `4x`, `10x`, `20x`, `40x`, or `100x`.
-- Enter a custom magnification label; custom values are saved locally for later sessions.
-- Toggle a composition grid.
-- Switch the preview framing between `9:16` and `3:4`.
-- Enable a 3-second capture countdown.
+### Magnification and labels
 
-### Annotated photographs
+- Built-in magnifications: `4x`, `10x`, `20x`, `40x`, `100x`.
+- Enter your own value (for example `60x`); the list is saved locally between sessions.
+- Name the sample; the name appears in the stamp.
 
-Captured images are processed and saved to the device's photo library. The image annotation includes:
+### Capture helpers
 
-- Specimen name.
-- Selected magnification label.
-- Selected filter.
-- Brightness and sharpness settings.
-- Capture date and time.
-- A visual scale bar.
+- Composition grid.
+- `9:16` and `3:4` preview framing.
+- Optional 3-second countdown before capture, to avoid shaking the setup.
 
-The app creates a PNG image with a dark information strip along the bottom, making saved captures easier to identify and organize.
+## How capsule counting works
+
+1. The frame is downscaled to a working width of 320 px for speed.
+2. Brightness, sharpness, and the selected filter are applied to the pixels.
+3. The image is smoothed and Sobel gradients are computed; an adaptive edge threshold depends on the sensitivity setting.
+4. A **circle Hough transform** votes for circle centers over the configured radius range, then each candidate is checked for a closed contour (enough of 16 points around the circle must lie on an edge), which rejects straight lines.
+5. Overlapping and nested circles are removed (non-maximum suppression).
+6. In multi-pass mode, steps 2 to 5 repeat for every brightness and sharpness pair. The pass whose count is closest to the average is kept, and its brightness and sharpness are applied to the image.
+
+Radius settings are in pixels of the 320 px working image. Results depend on lighting, focus, and how round and well-contrasted the objects are, so check the overlay and correct it manually when needed.
+
+## Scale ruler and diameters: read this first
+
+The ruler is always drawn as a segment equal to 20% of the image width. Its length in μm is chosen from the magnification label:
+
+| Magnification | Ruler length |
+| ------------- | ------------ |
+| up to 5x      | 500 μm       |
+| up to 15x     | 200 μm       |
+| up to 30x     | 100 μm       |
+| up to 60x     | 50 μm        |
+| above 60x     | 20 μm        |
+
+Capsule diameters in μm are computed from this same relation. That makes them **approximate values that depend entirely on how well this table matches your real optical setup** (objective, eyepiece or adapter, camera sensor, zoom). The app does not calibrate pixels to micrometres for a specific microscope. For quantitative work, check the ruler against a stage micrometer with your own equipment and treat the result as valid only for that setup.
 
 ## Platform support
 
-| Platform | Status | Notes |
-|---|---|---|
-| Android | Project target | Requires Android Studio / Android SDK for building |
-| iOS | Project target | Requires macOS and Xcode to build and sign an iOS app |
-| Windows, macOS, Linux, Web | Flutter project folders may be present | These platforms are not the primary target of this project |
+| Platform                   | Status                                  | Notes                                                 |
+| -------------------------- | --------------------------------------- | ----------------------------------------------------- |
+| Android                    | Primary target                          | Android Studio and Android SDK required for building  |
+| iOS                        | Primary target                          | macOS and Xcode required to build and sign            |
+| Windows, macOS, Linux, Web | Flutter scaffolding present, untested   | Not the main focus of this project                    |
 
-The shared Flutter UI is intended for Android and iOS. Camera access, photo-library permissions, and some camera controls can behave differently between devices. Test on real hardware before distributing a release.
+Camera access, photo-library permissions, and some camera controls behave differently between devices. Test on real hardware before distributing a release.
 
-## Screenshots
-
-Screenshots can be added here once representative captures from Android and iOS are available. For example:
-
-```text
-screenshots/
-├── android-camera.png
-├── android-controls.png
-└── ios-camera.png
-```
-
-To display an image hosted in the repository, add it and use Markdown:
-
-```md
-![MicroscopeCamera live preview](screenshots/android-camera.png)
-```
 
 ## Getting started
 
 ### Requirements
 
-Install the following tools before building the project:
-
-- [Flutter SDK](https://docs.flutter.dev/get-started/install) compatible with the Dart SDK constraint in `pubspec.yaml` (`^3.13.5`).
-- Dart SDK, included with Flutter.
+- [Flutter SDK](https://docs.flutter.dev/get-started/install) compatible with the Dart constraint in `pubspec.yaml` (`^3.13.5`).
 - [Git](https://git-scm.com/).
-- **Android:** Android Studio, Android SDK, and an emulator or Android device.
-- **iOS:** macOS, Xcode, Xcode command-line tools, and an iOS simulator or device.
-
-Check your local environment:
+- **Android:** Android Studio, Android SDK, and an emulator or device.
+- **iOS:** macOS, Xcode with command-line tools, and a simulator or device.
 
 ```bash
 flutter --version
 flutter doctor
 ```
 
-Resolve any required issues reported by `flutter doctor` before building.
-
-### Clone the repository
+### Clone and install
 
 ```bash
 git clone https://github.com/Miraelll/MicroscopeCamera.git
 cd MicroscopeCamera
-```
-
-### Install dependencies
-
-```bash
 flutter pub get
 ```
 
@@ -169,165 +166,110 @@ flutter analyze
 flutter test
 ```
 
-The test command runs the tests currently present in the repository. Add device-specific tests as the app evolves.
-
-## Running the application
-
-List the available devices:
+### Run
 
 ```bash
 flutter devices
+flutter run                   # or: flutter run -d <device-id>
 ```
 
-Run on a connected Android device or selected emulator:
-
-```bash
-flutter run
-```
-
-If more than one device is available, specify its ID:
-
-```bash
-flutter run -d <device-id>
-```
-
-For iOS, run the following commands on a Mac with Xcode configured:
-
-```bash
-open ios/Runner.xcworkspace
-```
-
-Select a simulator or connected iPhone in Xcode, configure signing if needed, and run the app. You can also use `flutter run -d <device-id>` after the iOS toolchain is configured.
+For iOS, open `ios/Runner.xcworkspace` in Xcode, configure signing, and run on a simulator or an iPhone.
 
 ## Building a release
 
-### Android APK
+**Android**
 
 ```bash
-flutter build apk --release
+flutter build apk --release          # build/app/outputs/flutter-apk/app-release.apk
+flutter build appbundle --release    # for Google Play
 ```
 
-The APK is normally created at:
-
-```text
-build/app/outputs/flutter-apk/app-release.apk
-```
-
-For Google Play distribution, build an Android App Bundle:
-
-```bash
-flutter build appbundle --release
-```
-
-Before publishing, configure the application ID, app signing, version, icons, and store metadata.
-
-### iOS
-
-iOS release builds must be created on macOS with Xcode:
+**iOS** (macOS and Xcode required)
 
 ```bash
 flutter build ios --release
 ```
 
-For App Store distribution, configure the bundle identifier, Apple Developer signing team, certificates/profiles, app permissions, and App Store Connect metadata in Xcode. An archive can then be prepared for distribution through Xcode.
+Before publishing, configure the application ID or bundle identifier, signing, version, icons, and store metadata. A `codemagic.yaml` is included for CI builds with Codemagic.
 
 ## How to use
 
-1. **Launch the app.** Allow camera access when prompted.
-2. **Position the specimen.** Place the phone camera at the microscope's camera/eyepiece adapter or use the device camera setup appropriate to your equipment.
-3. **Set the specimen label.** Tap the name field in the top bar and enter a descriptive name.
-4. **Choose a magnification label.** Select one of the presets or enter a custom value. This is a label, not an automatic measurement of optical magnification.
-5. **Compose the view.** Toggle the grid and select the `9:16` or `3:4` framing.
-6. **Adjust the image.** Set zoom, brightness, sharpness, filter, and focus to suit the specimen.
-7. **Capture.** Optionally enable the 3-second timer, then tap the shutter button.
-8. **Review the saved image.** The processed PNG is saved to the device photo library, subject to the relevant permission.
+1. **Launch the app** and allow camera access.
+2. **Get an image.** Attach the phone camera to the microscope, or open a photo from the gallery.
+3. **Name the sample** and **choose the magnification** in the top bar.
+4. **Tune the image:** brightness and sharpness spinboxes (or **Auto**), filter, zoom, focus.
+5. **Count capsules:** press **Count** for one pass, or **Multi** to set several brightness and sharpness values and get an average.
+6. **Review the overlay.** Turn on edit mode to remove false detections or add missed capsules.
+7. **Save.** Press the shutter button (with the optional 3-second timer in live mode); the result goes to your photo library.
 
-For repeatable scientific work, keep microscope illumination, camera position, and optical settings consistent. Calibrate the complete optical setup independently before using any scale reference for measurements.
+For repeatable work, keep illumination, camera position, and optical settings the same between shots.
 
-## Image processing and annotations
+## The saved image
 
-The app applies its selected color filter to the captured image and adds a metadata strip containing the specimen label, magnification label, filter, adjustment values, and timestamp.
+Each save produces a PNG named `capsules_<timestamp>.png` containing:
 
-The displayed brightness and sharpness controls primarily affect the visual appearance of the image; they do not recover detail that was not captured by the camera sensor. The automatic adjustment feature analyzes a sample frame to estimate image settings and should be treated as a convenience rather than a scientific calibration procedure.
-
-**Scale-bar caution:** the current scale-bar label is selected heuristically from the entered magnification label. It is not derived from a calibrated pixel-to-micrometre conversion for a specific microscope, objective, camera, or adapter. Do not use it for quantitative measurements until calibration is implemented and verified.
+- the photo with the selected filter, brightness, and sharpness applied;
+- every detected capsule outlined, numbered, and labeled with its diameter in μm;
+- a dark information strip at the bottom with four lines: sample name and magnification; capsule count (and the multi-pass average) with mean diameter and the min to max range; filter, brightness, and sharpness; and the capture date and time;
+- the scale ruler in the bottom-right corner of the strip.
 
 ## Project structure
 
-```text
+```
 MicroscopeCamera/
 ├── android/                 # Android application and native configuration
 ├── ios/                     # iOS application and Xcode configuration
 ├── lib/
-│   └── main.dart            # Flutter app entry point and camera interface
-├── linux/                   # Flutter desktop platform scaffolding
-├── macos/                   # Flutter desktop platform scaffolding
-├── web/                     # Flutter web platform scaffolding
-├── windows/                 # Flutter desktop platform scaffolding
+│   └── main.dart            # Camera UI, controls, filters, capsule detection, image stamping
+├── linux/ macos/ web/ windows/   # Flutter platform scaffolding
+├── codemagic.yaml           # CI configuration
 ├── icon.png                 # App icon source image
-├── pubspec.yaml             # Dependencies, version, and Flutter configuration
-├── pubspec.lock             # Locked Dart/Flutter dependency versions
-├── analysis_options.yaml    # Dart static-analysis configuration
-└── LICENSE                  # Project license
+├── pubspec.yaml             # Dependencies, version, Flutter configuration
+├── pubspec.lock             # Locked dependency versions
+├── analysis_options.yaml    # Static-analysis rules
+└── LICENSE                  # MIT license
 ```
 
-The camera UI, controls, filter processing, and capture annotation logic currently live primarily in `lib/main.dart`.
+Most of the application, including the detection algorithm, currently lives in `lib/main.dart`.
 
 ## Technology stack
 
-| Technology / package | Role |
-|---|---|
-| [Flutter](https://flutter.dev/) | Cross-platform UI framework |
-| [Dart](https://dart.dev/) | Application programming language |
-| [`camera`](https://pub.dev/packages/camera) | Camera preview, capture, focus, exposure, and zoom APIs |
-| [`camera_android_camerax`](https://pub.dev/packages/camera_android_camerax) | CameraX implementation for Android |
-| [`permission_handler`](https://pub.dev/packages/permission_handler) | Cross-platform permission handling dependency |
-| [`path_provider`](https://pub.dev/packages/path_provider) | Access to temporary and application directories |
-| [`gal`](https://pub.dev/packages/gal) | Saving images to the device gallery |
-| [`shared_preferences`](https://pub.dev/packages/shared_preferences) | Persisting custom magnification labels locally |
-| [`flutter_launcher_icons`](https://pub.dev/packages/flutter_launcher_icons) | Generating launcher icons |
-| [`flutter_lints`](https://pub.dev/packages/flutter_lints) | Dart/Flutter lint rules |
+| Package                                                                     | Role                                                    |
+| --------------------------------------------------------------------------- | ------------------------------------------------------- |
+| [Flutter](https://flutter.dev/) / [Dart](https://dart.dev/)                 | UI framework and language                               |
+| [`camera`](https://pub.dev/packages/camera)                                 | Preview, capture, focus, exposure, and zoom             |
+| [`camera_android_camerax`](https://pub.dev/packages/camera_android_camerax) | CameraX implementation for Android                      |
+| [`image_picker`](https://pub.dev/packages/image_picker)                     | Opening photos from the gallery                         |
+| [`gal`](https://pub.dev/packages/gal)                                       | Saving images to the device gallery                     |
+| [`path_provider`](https://pub.dev/packages/path_provider)                   | Temporary directory for the result file                 |
+| [`shared_preferences`](https://pub.dev/packages/shared_preferences)         | Storing custom magnifications locally                   |
+| [`flutter_launcher_icons`](https://pub.dev/packages/flutter_launcher_icons) | Generating launcher icons (dev)                         |
+| [`flutter_lints`](https://pub.dev/packages/flutter_lints)                   | Lint rules (dev)                                        |
 
-Dependency versions are defined in `pubspec.yaml` and `pubspec.lock`.
+Image analysis uses only Dart and Flutter's own `dart:ui` and `compute` (isolates); there is no external computer-vision library. Exact versions are in `pubspec.yaml` and `pubspec.lock`.
 
 ## Permissions and privacy
 
-MicroscopeCamera needs access to the camera to show a live preview and capture photographs. It may also request photo-library access to save captured images.
+- **Camera:** required for the live preview and capture.
+- **Photo library:** used to save results and to open photos from the gallery.
+- Custom magnifications are stored locally with `shared_preferences`.
+- Images are processed and saved on the device. The app does not upload images or sync accounts.
 
-- Grant camera permission when prompted.
-- Grant the relevant photo-library permission if you want to save captures.
-- Permission prompts and settings differ between Android and iOS.
-- Custom magnification labels are stored locally using `shared_preferences`.
-- The current capture flow saves images on the device. This README does not imply cloud upload, account synchronization, or remote image processing.
-
-Ensure the native Android and iOS permission descriptions and configuration match the app's actual behavior before publishing. Users should be able to deny permissions without being misled about why access is requested.
+You can deny a permission; the related feature will then be unavailable.
 
 ## Troubleshooting
 
-### The camera preview does not appear
+**The camera preview does not appear.** Check that the device has a working camera, grant camera permission in system settings, close other apps using the camera, and try a physical device instead of an emulator.
 
-- Check that the device has a working camera.
-- Grant camera permission in system settings.
-- Close other apps that may be using the camera and restart the app.
-- Try a physical device if the emulator does not provide a suitable camera.
-- Run `flutter doctor` and inspect the debug output from `flutter run`.
+**Captures are not saved.** Check photo-library permission and free storage. On iOS, verify the photo-library usage descriptions in `Info.plist`.
 
-### Captures are not saved
+**Too many or too few capsules are detected.** Adjust the sensitivity and the minimum and maximum radius in the Multi dialog, improve lighting and focus, try another filter, or fix the result with manual edit mode.
 
-- Check photo-library permissions in the operating system settings.
-- Confirm the device has available storage.
-- Check the application logs for errors from the gallery-saving operation.
-- On iOS, verify the photo-library usage descriptions and privacy configuration.
+**Focus, exposure, or zoom behave differently.** These depend on camera hardware and the platform implementation; some devices expose narrower ranges or lack manual focus.
 
-### Zoom, focus, or exposure controls behave differently
+**iOS build fails on Windows.** iOS builds require macOS and Xcode. Use a Mac or a macOS CI service such as Codemagic.
 
-These features depend on the camera hardware and platform implementation. Some devices expose narrower ranges or do not support a requested operation. Test the behavior on the target phone.
-
-### iOS build fails on Windows
-
-A native iOS release build requires macOS and Xcode. On Windows, you can develop shared Dart/Flutter code and build Android, but you need a Mac or a macOS CI service to compile, sign, and distribute the iOS app.
-
-### Dependency or SDK errors
+**Dependency or SDK errors.**
 
 ```bash
 flutter clean
@@ -335,57 +277,33 @@ flutter pub get
 flutter doctor -v
 ```
 
-If the problem persists, record the Flutter version, operating system, target device, and complete error output when opening an issue.
-
 ## Roadmap
 
-Potential next steps for the project include:
+Ideas for future development, not promises:
 
-- [ ] Add screenshots and a short demonstration video.
-- [ ] Test and document behavior on a range of Android and iOS devices.
-- [ ] Add a dedicated in-app gallery/history for microscope captures.
-- [ ] Add export and sharing options for annotated images.
-- [ ] Implement microscope-specific calibration for a physically accurate scale bar.
-- [ ] Add repeatable capture profiles for different microscopes and objectives.
-- [ ] Expand automated tests for image processing and capture workflows.
-- [ ] Set up CI builds and release artifacts for Android and iOS.
-
-Roadmap items are ideas for future development, not claims that these features are already implemented.
+- [ ] Real pixel-to-μm calibration per microscope, objective, and camera, with saved profiles.
+- [ ] Interface localization (English alongside Russian).
+- [ ] Export of per-capsule measurements (CSV).
+- [ ] Split `lib/main.dart` into separate modules and add tests for the detection algorithm.
+- [ ] In-app gallery and history of captures.
+- [ ] Screenshots and a short demo video.
+- [ ] Wider device testing on Android and iOS.
 
 ## Contributing
 
-Contributions, bug reports, and feature suggestions are welcome.
+Bug reports, suggestions, and pull requests are welcome.
 
-1. Fork the repository.
-2. Create a feature branch:
+1. Fork the repository and create a branch: `git checkout -b feature/my-improvement`.
+2. Make your changes and run `dart format .`, `flutter analyze`, and `flutter test`.
+3. Open a pull request describing the problem, the solution, and how you tested it.
 
-   ```bash
-   git checkout -b feature/my-improvement
-   ```
-
-3. Make your changes and run the checks:
-
-   ```bash
-   dart format .
-   flutter analyze
-   flutter test
-   ```
-
-4. Commit your changes and push the branch.
-5. Open a pull request describing the problem, the solution, and how it was tested.
-
-For bug reports, include the device model, OS version, Flutter version, reproduction steps, and relevant logs. Do not attach private or sensitive specimen images unless you have permission to share them.
+For bug reports, include the device model, OS version, Flutter version, reproduction steps, and logs. Do not attach private specimen images unless you have permission to share them.
 
 ## License
 
-This project is distributed under the [MIT License](LICENSE).
+Distributed under the [MIT License](LICENSE).
 
 ---
 
-<div align="center">
+**MicroscopeCamera** · Microscope photography and capsule counting with Flutter · [Report a bug](https://github.com/Miraelll/MicroscopeCamera/issues)
 
-**MicroscopeCamera** · Cross-platform microscope photography with Flutter
-
-[Repository](https://github.com/Miraelll/MicroscopeCamera) · [Report a bug](https://github.com/Miraelll/MicroscopeCamera/issues)
-
-</div>
