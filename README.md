@@ -1,3 +1,4 @@
+<div align="center">
 # 🔬 Microscope LAB
 
 ### Microscope photography and microcapsule counting on your phone: manual image controls, optical filters, automatic circle detection, diameters in μm, and a stamped, scaled result saved to your gallery.
@@ -7,6 +8,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-Android%20%7C%20iOS-333333)](#platform-support)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
+</div>
 ---
 
 ## Contents
@@ -299,11 +301,14 @@ Bug reports, suggestions, and pull requests are welcome.
 
 For bug reports, include the device model, OS version, Flutter version, reproduction steps, and logs. Do not attach private specimen images unless you have permission to share them.
 
+<div align="center">
 ## License
 
 Distributed under the [MIT License](LICENSE).
 
 ---
 
-**MicroscopeCamera** · Microscope photography and capsule counting with Flutter · [Report a bug](https://github.com/Miraelll/MicroscopeCamera/issues)
+**Microscope LAB** · Microscope photography and capsule counting with Flutter · [Report a bug](https://github.com/Miraelll/Microscope-LAB/issues)
+
+</div>
 
