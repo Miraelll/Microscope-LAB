@@ -302,6 +302,7 @@ Bug reports, suggestions, and pull requests are welcome.
 For bug reports, include the device model, OS version, Flutter version, reproduction steps, and logs. Do not attach private specimen images unless you have permission to share them.
 
 <div align="center">
+  
 ## License
 
 Distributed under the [MIT License](LICENSE).
