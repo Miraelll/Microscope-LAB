@@ -43,11 +43,13 @@ The result is saved as a PNG with the filter applied, every detected capsule out
 
 ## What's new
 
-- **Automatic capsule detection and counting** with a circle Hough transform, running in a background isolate so the interface stays responsive.
+- **Automatic capsule detection and counting** with a circle Hough transform and local background subtraction, running in a background isolate so the interface stays responsive.
 - **Multi-pass calculation:** run the detection over several brightness and sharpness values and get the average count, with the most representative pass applied.
 - **Diameters in μm** for every detected capsule, plus mean, minimum, and maximum in the stamp.
 - **Photo mode:** open any photo from the gallery and analyze it with the same tools as the live camera.
-- **Manual correction:** tap a capsule to remove it, tap an empty spot to add one.
+- **Interactive ocular grid alignment:** automatically fits the grid to the bright microscope circle on loaded photos, or lets you move it with one finger and resize it with two fingers to define the exact region of interest (ROI).
+- **Two-finger pinch-to-zoom and dynamic label scaling:** zoom in and pan around the image; capsule labels (`μm`) and contour lines automatically shrink as you zoom in so they do not clutter the view.
+- **Manual correction with magnetic snap:** tap a capsule to remove it, tap an empty spot to add one, or drag existing points—markers magnetically snap to the nearest capsule contour and adapt to its radius.
 - **Spinbox controls** for brightness and sharpness (step 0.1), plus one-tap **auto-tuning**.
 - **Richer stamp** with capsule statistics, filter, settings, date, and a scale ruler.
 
@@ -105,13 +107,13 @@ Filters apply to the preview, to capsule detection, and to the saved image. They
 
 ## How capsule counting works
 
-1. The frame is downscaled to a working width of 320 px for speed.
-2. Brightness, sharpness, and the selected filter are applied to the pixels.
-3. The image is smoothed and Sobel gradients are computed; an adaptive edge threshold depends on the sensitivity setting.
-4. A **circle Hough transform** votes for circle centers over the configured radius range, then each candidate is checked for a closed contour (enough of 16 points around the circle must lie on an edge), which rejects straight lines.
-5. Overlapping and nested circles are removed (non-maximum suppression).
-6. In multi-pass mode, steps 2 to 5 repeat for every brightness and sharpness pair. The pass whose count is closest to the average is kept, and its brightness and sharpness are applied to the image.
-
+1. The frame is downscaled to a working width of 320–480 px for speed and sub-pixel contour preservation.
+2. A region-of-interest (ROI) mask is built from the aligned ocular grid circle, excluding dark borders and blue chromatic aberration rims.
+3. Brightness, sharpness, and the selected filter are applied, and **local background subtraction** (25×25 sliding window) removes uneven illumination and JPEG compression noise.
+4. The image is smoothed and Sobel gradients are computed; an adaptive edge threshold depends on the sensitivity setting.
+5. A **circle Hough transform** and radial symmetry check vote for circle centers over the configured radius range, verifying that the capsule wall is darker/more contrasted than the surrounding background and forms a closed contour, which rejects straight lines, fibers, and background noise.
+6. Overlapping and nested circles are removed (non-maximum suppression).
+7. In multi-pass mode, the detection steps repeat for every brightness and sharpness pair. The pass whose count is closest to the average is kept, and its brightness and sharpness are applied to the image.
 Radius settings are in pixels of the 320 px working image. Results depend on lighting, focus, and how round and well-contrasted the objects are, so check the overlay and correct it manually when needed.
 
 ## Scale ruler and diameters: read this first
