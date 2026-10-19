@@ -107,13 +107,14 @@ Filters apply to the preview, to capsule detection, and to the saved image. They
 
 ## How capsule counting works
 
-1. The frame is downscaled to a working width of 320–480 px for speed and sub-pixel contour preservation.
+1. The frame is downscaled to a working width of 320 px for speed.
 2. A region-of-interest (ROI) mask is built from the aligned ocular grid circle, excluding dark borders and blue chromatic aberration rims.
-3. Brightness, sharpness, and the selected filter are applied, and **local background subtraction** (25×25 sliding window) removes uneven illumination and JPEG compression noise.
+3. Brightness, sharpness, and the selected filter are applied to the pixels.
 4. The image is smoothed and Sobel gradients are computed; an adaptive edge threshold depends on the sensitivity setting.
-5. A **circle Hough transform** and radial symmetry check vote for circle centers over the configured radius range, verifying that the capsule wall is darker/more contrasted than the surrounding background and forms a closed contour, which rejects straight lines, fibers, and background noise.
+5. A **circle Hough transform** votes for circle centers over the configured radius range, then each candidate is checked for a closed contour (enough of 16 points around the circle must lie on an edge), which rejects straight lines.
 6. Overlapping and nested circles are removed (non-maximum suppression).
-7. In multi-pass mode, the detection steps repeat for every brightness and sharpness pair. The pass whose count is closest to the average is kept, and its brightness and sharpness are applied to the image.
+7. In multi-pass mode, steps 2 to 5 repeat for every brightness and sharpness pair. The pass whose count is closest to the average is kept, and its brightness and sharpness are applied to the image.
+
 Radius settings are in pixels of the 320 px working image. Results depend on lighting, focus, and how round and well-contrasted the objects are, so check the overlay and correct it manually when needed.
 
 ## Scale ruler and diameters: read this first
@@ -201,10 +202,11 @@ Before publishing, configure the application ID or bundle identifier, signing, v
 1. **Launch the app** and allow camera access.
 2. **Get an image.** Attach the phone camera to the microscope, or open a photo from the gallery.
 3. **Name the sample** and **choose the magnification** in the top bar.
-4. **Tune the image:** brightness and sharpness spinboxes (or **Auto**), filter, zoom, focus.
-5. **Count capsules:** press **Count** for one pass, or **Multi** to set several brightness and sharpness values and get an average.
-6. **Review the overlay.** Turn on edit mode to remove false detections or add missed capsules.
-7. **Save.** Press the shutter button (with the optional 3-second timer in live mode); the result goes to your photo library.
+4. **Align the grid**: let the app auto-fit the grid to the ocular circle or adjust it manually (1 finger to move, 2 fingers to resize).
+5. **Tune the image:** brightness and sharpness spinboxes (or **Auto**), filter, zoom, focus.
+6. **Count capsules:** press **Count** for one pass, or **Multi** to set several brightness and sharpness values and get an average.
+7. **Review the overlay.** Turn on edit mode to remove false detections or add missed capsules.
+8. **Save.** Press the shutter button (with the optional 3-second timer in live mode); the result goes to your photo library.
 
 For repeatable work, keep illumination, camera position, and optical settings the same between shots.
 
