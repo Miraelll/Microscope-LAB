@@ -5,9 +5,11 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:gal/gal.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -16,16 +18,24 @@ Future<void> main() async {
 
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
 
-  final cameras = await availableCameras();
-  final camera = cameras.firstWhere(
-    (camera) => camera.lensDirection == CameraLensDirection.back,
-    orElse: () =>
-        cameras.isEmpty ? throw Exception('Камеры не найдены') : cameras.first,
-  );
+  List<CameraDescription> cameras = [];
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    debugPrint('Ошибка поиска камер: $e');
+  }
 
-  runApp(MicroscopeApp(camera: camera));
+  final CameraDescription? backCamera = cameras.isEmpty
+      ? null
+      : cameras.firstWhere(
+          (c) => c.lensDirection == CameraLensDirection.back,
+          orElse: () => cameras.first,
+        );
+
+  runApp(MicroscopeApp(camera: backCamera));
 }
 
+// Набор лабораторных оптических фильтров
 enum LabFilter {
   standard('Стандарт'),
   highDetail('Контуры HD'),
@@ -37,8 +47,425 @@ enum LabFilter {
   const LabFilter(this.title);
 }
 
+// Модель одной распознанной капсулы (координаты и радиус нормализованы к ширине кадра 0.0..1.0)
+class DetectedCapsule {
+  final double cxNorm; // X центра относительно ширины (0..1)
+  final double cyNorm; // Y центра относительно высоты (0..1)
+  final double rNorm; // Радиус относительно ширины (0..1)
+  final double score;
+
+  const DetectedCapsule({
+    required this.cxNorm,
+    required this.cyNorm,
+    required this.rNorm,
+    this.score = 1.0,
+  });
+
+  // Диаметр в пикселях для заданной ширины изображения
+  double diameterPx(double imageWidth) => 2.0 * rNorm * imageWidth;
+
+  // Диаметр в микрометрах (мкм), где калибровочный отрезок 0.20 * width равен scaleMicrons
+  double diameterMicrons(double scaleMicrons) =>
+      2.0 * rNorm * (scaleMicrons / 0.20);
+}
+
+// Входные данные для фонового изолята мульти-расчета капсул
+class MultiPassTask {
+  final Uint8List rgbaBytes;
+  final int width;
+  final int height;
+  final List<double> brightnessList;
+  final List<double> sharpnessList;
+  final int filterIndex;
+  final int minRadiusPx;
+  final int maxRadiusPx;
+  final double sensitivity; // 0.1 .. 1.0
+
+  const MultiPassTask({
+    required this.rgbaBytes,
+    required this.width,
+    required this.height,
+    required this.brightnessList,
+    required this.sharpnessList,
+    required this.filterIndex,
+    required this.minRadiusPx,
+    required this.maxRadiusPx,
+    required this.sensitivity,
+  });
+}
+
+// Результат одного прохода при конкретной паре (Яркость, Четкость)
+class SinglePassSummary {
+  final double brightness;
+  final double sharpness;
+  final List<DetectedCapsule> capsules;
+
+  const SinglePassSummary({
+    required this.brightness,
+    required this.sharpness,
+    required this.capsules,
+  });
+}
+
+// Итоговый результат мульти-расчета
+class MultiPassResult {
+  final List<DetectedCapsule> bestCapsules;
+  final double averageCount;
+  final int minCount;
+  final int maxCount;
+  final double bestBrightness;
+  final double bestSharpness;
+  final List<SinglePassSummary> passes;
+
+  const MultiPassResult({
+    required this.bestCapsules,
+    required this.averageCount,
+    required this.minCount,
+    required this.maxCount,
+    required this.bestBrightness,
+    required this.bestSharpness,
+    required this.passes,
+  });
+}
+
+// ============================================================================
+// ФОНОВЫЙ АЛГОРИТМ ПОИСКА КАПСУЛ (ПРЕОБРАЗОВАНИЕ ХАФА + ГРАДИЕНТНЫЙ АНАЛИЗ)
+// Выполняется в отдельном потоке (Isolate), не блокируя интерфейс
+// ============================================================================
+MultiPassResult _runMultiPassIsolate(MultiPassTask task) {
+  final List<SinglePassSummary> passes = [];
+
+  for (final double b in task.brightnessList) {
+    for (final double s in task.sharpnessList) {
+      final capsules = _detectCapsulesSinglePass(
+        rgba: task.rgbaBytes,
+        w: task.width,
+        h: task.height,
+        brightness: b,
+        sharpness: s,
+        filterIndex: task.filterIndex,
+        minR: task.minRadiusPx,
+        maxR: task.maxRadiusPx,
+        sensitivity: task.sensitivity,
+      );
+      passes.add(
+        SinglePassSummary(brightness: b, sharpness: s, capsules: capsules),
+      );
+    }
+  }
+
+  if (passes.isEmpty) {
+    return const MultiPassResult(
+      bestCapsules: [],
+      averageCount: 0,
+      minCount: 0,
+      maxCount: 0,
+      bestBrightness: 0.0,
+      bestSharpness: 1.0,
+      passes: [],
+    );
+  }
+
+  double total = 0;
+  int minC = passes.first.capsules.length;
+  int maxC = passes.first.capsules.length;
+
+  for (final p in passes) {
+    final c = p.capsules.length;
+    total += c;
+    if (c < minC) minC = c;
+    if (c > maxC) maxC = c;
+  }
+
+  final double avgCount = total / passes.length;
+
+  // Выбираем проход, количество капсул в котором ближе всего к среднему значению
+  SinglePassSummary bestPass = passes.first;
+  double minDiff = (bestPass.capsules.length - avgCount).abs();
+
+  for (final p in passes) {
+    final diff = (p.capsules.length - avgCount).abs();
+    if (diff < minDiff) {
+      minDiff = diff;
+      bestPass = p;
+    }
+  }
+
+  return MultiPassResult(
+    bestCapsules: bestPass.capsules,
+    averageCount: avgCount,
+    minCount: minC,
+    maxCount: maxC,
+    bestBrightness: bestPass.brightness,
+    bestSharpness: bestPass.sharpness,
+    passes: passes,
+  );
+}
+
+List<DetectedCapsule> _detectCapsulesSinglePass({
+  required Uint8List rgba,
+  required int w,
+  required int h,
+  required double brightness,
+  required double sharpness,
+  required int filterIndex,
+  required int minR,
+  required int maxR,
+  required double sensitivity,
+}) {
+  final int numPixels = w * h;
+  final Float32List lum = Float32List(numPixels);
+
+  // 1. Применяем настройки Яркости, Четкости и выбранного фильтра к пикселям
+  double contrast = 1.0 + (sharpness * 0.14);
+  double brightnessOffset = brightness * 8.0;
+  double rScale = 1.0, gScale = 1.0, bScale = 1.0;
+
+  if (filterIndex == LabFilter.highDetail.index) {
+    contrast *= 1.28;
+    brightnessOffset -= 12.0;
+  } else if (filterIndex == LabFilter.coldLight.index) {
+    rScale = 0.92;
+    gScale = 0.98;
+    bScale = 1.14;
+    contrast *= 1.08;
+  } else if (filterIndex == LabFilter.achromat.index) {
+    contrast *= 1.15;
+  }
+
+  final bool isInverted = filterIndex == LabFilter.darkField.index;
+
+  for (int i = 0; i < numPixels; i++) {
+    final int idx = i * 4;
+    double r = rgba[idx].toDouble();
+    double g = rgba[idx + 1].toDouble();
+    double b = rgba[idx + 2].toDouble();
+
+    if (isInverted) {
+      r = 255.0 - r;
+      g = 255.0 - g;
+      b = 255.0 - b;
+    }
+
+    r = (r - 128.0) * (contrast * rScale) + 128.0 + brightnessOffset;
+    g = (g - 128.0) * (contrast * gScale) + 128.0 + brightnessOffset;
+    b = (b - 128.0) * (contrast * bScale) + 128.0 + brightnessOffset;
+
+    r = r.clamp(0.0, 255.0);
+    g = g.clamp(0.0, 255.0);
+    b = b.clamp(0.0, 255.0);
+
+    lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+  }
+
+  // 2. Сглаживание 3x3 для устранения мелкого шума матрицы
+  final Float32List smooth = Float32List(numPixels);
+  for (int y = 1; y < h - 1; y++) {
+    for (int x = 1; x < w - 1; x++) {
+      final int p = y * w + x;
+      smooth[p] =
+          (lum[p - w - 1] +
+              lum[p - w] * 2 +
+              lum[p - w + 1] +
+              lum[p - 1] * 2 +
+              lum[p] * 4 +
+              lum[p + 1] * 2 +
+              lum[p + w - 1] +
+              lum[p + w] * 2 +
+              lum[p + w + 1]) /
+          16.0;
+    }
+  }
+
+  // 3. Вычисление градиентов Собеля (Gx, Gy и магнитуды G)
+  final Float32List gxArr = Float32List(numPixels);
+  final Float32List gyArr = Float32List(numPixels);
+  final Float32List magArr = Float32List(numPixels);
+
+  double sumMag = 0;
+  int magCount = 0;
+
+  for (int y = 2; y < h - 2; y++) {
+    for (int x = 2; x < w - 2; x++) {
+      final int p = y * w + x;
+      final double gx =
+          -smooth[p - w - 1] +
+          smooth[p - w + 1] -
+          2.0 * smooth[p - 1] +
+          2.0 * smooth[p + 1] -
+          smooth[p + w - 1] +
+          smooth[p + w + 1];
+
+      final double gy =
+          -smooth[p - w - 1] -
+          2.0 * smooth[p - w] -
+          smooth[p - w + 1] +
+          smooth[p + w - 1] +
+          2.0 * smooth[p + w] +
+          smooth[p + w + 1];
+
+      final double mag = math.sqrt(gx * gx + gy * gy);
+      gxArr[p] = gx;
+      gyArr[p] = gy;
+      magArr[p] = mag;
+
+      if (mag > 12.0) {
+        sumMag += mag;
+        magCount++;
+      }
+    }
+  }
+
+  if (magCount < 20) return [];
+
+  final double meanMag = sumMag / magCount;
+  // Адаптивный порог границ с учетом чувствительности
+  final double edgeThreshold = math.max(
+    18.0,
+    meanMag * (1.25 - sensitivity * 0.55),
+  );
+
+  // Список граничных пикселей для быстрого голосования Хафа
+  final List<int> edgeIndices = [];
+  for (int y = 4; y < h - 4; y++) {
+    for (int x = 4; x < w - 4; x++) {
+      final int p = y * w + x;
+      if (magArr[p] >= edgeThreshold) {
+        edgeIndices.add(p);
+      }
+    }
+  }
+
+  // 4. Круговое преобразование Хафа (Circle Hough Transform) по диапазону радиусов
+  final int clampedMinR = minR.clamp(4, math.min(w, h) ~/ 3);
+  final int clampedMaxR = maxR.clamp(clampedMinR + 2, math.min(w, h) ~/ 2);
+  final int rStep = (clampedMaxR - clampedMinR) > 24 ? 2 : 1;
+
+  final List<DetectedCapsule> rawCandidates = [];
+  final Uint16List acc = Uint16List(numPixels);
+
+  // Предвычисленные 16 точек на окружности для проверки радиальной целостности контура капсулы
+  const int numAngles = 16;
+  final List<double> cosTable = List.generate(
+    numAngles,
+    (i) => math.cos(i * 2 * math.pi / numAngles),
+  );
+  final List<double> sinTable = List.generate(
+    numAngles,
+    (i) => math.sin(i * 2 * math.pi / numAngles),
+  );
+
+  for (int r = clampedMinR; r <= clampedMaxR; r += rStep) {
+    acc.fillRange(0, numPixels, 0);
+
+    // Голосование вдоль направления градиента (+r и -r)
+    for (int i = 0; i < edgeIndices.length; i++) {
+      final int p = edgeIndices[i];
+      final int x = p % w;
+      final int y = p ~/ w;
+      final double mag = magArr[p];
+      final double ux = gxArr[p] / mag;
+      final double uy = gyArr[p] / mag;
+
+      final int cx1 = (x + ux * r).round();
+      final int cy1 = (y + uy * r).round();
+      if (cx1 >= r && cx1 < w - r && cy1 >= r && cy1 < h - r) {
+        acc[cy1 * w + cx1] += 1;
+      }
+
+      final int cx2 = (x - ux * r).round();
+      final int cy2 = (y - uy * r).round();
+      if (cx2 >= r && cx2 < w - r && cy2 >= r && cy2 < h - r) {
+        acc[cy2 * w + cx2] += 1;
+      }
+    }
+
+    // Поиск локальных пиков аккумулятора и проверка круговой симметрии (защита от прямых линий)
+    final int minVotes = math.max(
+      5,
+      (r * 0.45 * (1.3 - sensitivity * 0.5)).round(),
+    );
+
+    for (int cy = r; cy < h - r; cy += 2) {
+      for (int cx = r; cx < w - r; cx += 2) {
+        final int idx = cy * w + cx;
+        final int votes = acc[idx];
+        if (votes < minVotes) continue;
+
+        // Проверяем, что это локальный максимум в окрестности 3x3
+        if (votes < acc[idx - 1] ||
+            votes < acc[idx + 1] ||
+            votes < acc[idx - w] ||
+            votes < acc[idx + w]) {
+          continue;
+        }
+
+        // Проверяем, сколько секторов из 16 реально имеют границу на расстоянии r
+        int activeSectors = 0;
+        double ringGradSum = 0;
+        for (int a = 0; a < numAngles; a++) {
+          final int px = (cx + r * cosTable[a]).round();
+          final int py = (cy + r * sinTable[a]).round();
+          final double g = magArr[py * w + px];
+          if (g >= edgeThreshold * 0.70) {
+            activeSectors++;
+            ringGradSum += g;
+          }
+        }
+
+        // Требуем минимум 9 из 16 секторов (более 55% дуги окружности)
+        final int requiredSectors = (10 - (sensitivity * 3).round()).clamp(
+          7,
+          12,
+        );
+        if (activeSectors >= requiredSectors) {
+          final double score =
+              (votes * 1.5) +
+              (activeSectors * 4.0) +
+              (ringGradSum / numAngles) * 0.1;
+          rawCandidates.add(
+            DetectedCapsule(
+              cxNorm: cx / w,
+              cyNorm: cy / h,
+              rNorm: r / w,
+              score: score,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  // 5. Подавление немаксимумов (NMS) — убираем дублирующиеся и вложенные окружности
+  rawCandidates.sort((a, b) => b.score.compareTo(a.score));
+  final List<DetectedCapsule> accepted = [];
+  final double aspect = h / w;
+
+  for (final cand in rawCandidates) {
+    bool overlaps = false;
+    for (final ex in accepted) {
+      final double dx = cand.cxNorm - ex.cxNorm;
+      final double dy = (cand.cyNorm - ex.cyNorm) * aspect;
+      final double dist = math.sqrt(dx * dx + dy * dy);
+      final double minAllowedDist = math.max(cand.rNorm, ex.rNorm) * 0.80;
+      if (dist < minAllowedDist) {
+        overlaps = true;
+        break;
+      }
+    }
+    if (!overlaps) {
+      accepted.add(cand);
+    }
+  }
+
+  return accepted;
+}
+
+// ============================================================================
+// ОСНОВНОЕ ПРИЛОЖЕНИЕ
+// ============================================================================
 class MicroscopeApp extends StatelessWidget {
-  final CameraDescription camera;
+  final CameraDescription? camera;
 
   const MicroscopeApp({super.key, required this.camera});
 
@@ -53,7 +480,7 @@ class MicroscopeApp extends StatelessWidget {
 }
 
 class CameraScreen extends StatefulWidget {
-  final CameraDescription camera;
+  final CameraDescription? camera;
 
   const CameraScreen({super.key, required this.camera});
 
@@ -62,9 +489,16 @@ class CameraScreen extends StatefulWidget {
 }
 
 class _CameraScreenState extends State<CameraScreen> {
-  late CameraController _controller;
+  CameraController? _controller;
   bool _isCameraInitialized = false;
+  final ImagePicker _picker = ImagePicker();
 
+  // Источник изображения: null = режим живой камеры, иначе = загруженное/снятое фото
+  Uint8List? _loadedImageBytes;
+  int _loadedImageWidth = 1080;
+  int _loadedImageHeight = 1920;
+
+  // Параметры спинбоксов (шаг 0.1) — работают и для камеры, и для фото из галереи!
   double _brightness = 0.0;
   double _sharpness = 1.0;
 
@@ -85,20 +519,33 @@ class _CameraScreenState extends State<CameraScreen> {
   int _countdown = 0;
   bool _isProcessing = false;
 
-  String _substanceName = 'Образец №1';
+  String _substanceName = 'Капсулы №1';
   String _magnification = '40x';
-
-  // Список доступных увеличений (включая сохраненные пользователем)
   List<String> _magnificationList = ['4x', '10x', '20x', '40x', '100x'];
+
+  // Данные подсчета капсул и мульти-расчета
+  List<DetectedCapsule> _capsules = [];
+  double? _multiPassAverageCount;
+  List<SinglePassSummary> _lastMultiPassDetails = [];
+  bool _showCapsuleOverlay = true;
+  bool _manualEditCapsules = false; // Ручное добавление/удаление капсул по тапу
+
+  // Настройки алгоритма поиска и мульти-расчета
+  String _multiBrightnessInput = '-0.5 0.0 0.5 1.0';
+  String _multiSharpnessInput = '1.0 2.0 3.0';
+  int _minCapsuleRadiusPx = 8;
+  int _maxCapsuleRadiusPx = 45;
+  double _detectionSensitivity = 0.65;
 
   @override
   void initState() {
     super.initState();
     _loadCustomMagnifications();
-    _initCamera();
+    if (widget.camera != null) {
+      _initCamera();
+    }
   }
 
-  // Загрузка кастомных увеличений из памяти телефона
   Future<void> _loadCustomMagnifications() async {
     final prefs = await SharedPreferences.getInstance();
     final savedList = prefs.getStringList('custom_magnifications');
@@ -109,7 +556,6 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // Сохранение нового увеличения в память
   Future<void> _saveNewMagnification(String newVal) async {
     final formatted = newVal.endsWith('x') ? newVal : '${newVal}x';
     if (!_magnificationList.contains(formatted)) {
@@ -127,23 +573,27 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initCamera() async {
-    _controller = CameraController(
-      widget.camera,
+    final cam = widget.camera;
+    if (cam == null) return;
+
+    final ctrl = CameraController(
+      cam,
       ResolutionPreset.veryHigh,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.jpeg,
     );
+    _controller = ctrl;
 
     try {
-      await _controller.initialize();
-      await _controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
-      await _controller.setFlashMode(FlashMode.off);
+      await ctrl.initialize();
+      await ctrl.lockCaptureOrientation(DeviceOrientation.portraitUp);
+      await ctrl.setFlashMode(FlashMode.off);
 
       try {
-        _minExposure = await _controller.getMinExposureOffset();
-        _maxExposure = await _controller.getMaxExposureOffset();
-        _minZoom = await _controller.getMinZoomLevel();
-        _maxZoom = math.min(await _controller.getMaxZoomLevel(), 8.0);
+        _minExposure = await ctrl.getMinExposureOffset();
+        _maxExposure = await ctrl.getMaxExposureOffset();
+        _minZoom = await ctrl.getMinZoomLevel();
+        _maxZoom = math.min(await ctrl.getMaxZoomLevel(), 8.0);
       } catch (_) {}
 
       if (mounted) {
@@ -158,12 +608,43 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
-    _controller.dispose();
+    _controller?.dispose();
     super.dispose();
   }
 
+  // Калибровочная длина линейки (в мкм) для выбранного увеличения
+  double _getScaleMicrons() {
+    final int cleanMag =
+        int.tryParse(_magnification.replaceAll(RegExp(r'[^0-9]'), '')) ?? 40;
+    if (cleanMag <= 5) return 500.0;
+    if (cleanMag <= 15) return 200.0;
+    if (cleanMag <= 30) return 100.0;
+    if (cleanMag <= 60) return 50.0;
+    return 20.0;
+  }
+
+  // Статистика диаметров распознанных капсул (в мкм)
+  Map<String, double> _getDiameterStatsMicrons() {
+    if (_capsules.isEmpty) {
+      return {'mean': 0.0, 'min': 0.0, 'max': 0.0};
+    }
+    final double scaleUm = _getScaleMicrons();
+    double sum = 0.0;
+    double minD = double.infinity;
+    double maxD = 0.0;
+
+    for (final c in _capsules) {
+      final d = c.diameterMicrons(scaleUm);
+      sum += d;
+      if (d < minD) minD = d;
+      if (d > maxD) maxD = d;
+    }
+
+    return {'mean': sum / _capsules.length, 'min': minD, 'max': maxD};
+  }
+
   ColorFilter _buildColorFilter({bool isFinalCapture = false}) {
-    final double captureBoost = isFinalCapture ? 1.15 : 1.0;
+    final double captureBoost = isFinalCapture ? 1.12 : 1.0;
     double contrast = (1.0 + (_sharpness * 0.14)) * captureBoost;
     double brightnessOffset = _brightness * 8.0;
 
@@ -273,15 +754,17 @@ class _CameraScreenState extends State<CameraScreen> {
       });
     }
 
-    try {
-      final double norm = _brightness / 10.0;
-      final double expOffset = norm >= 0
-          ? norm * _maxExposure * 0.7
-          : -norm * _minExposure * 0.7;
-      await _controller.setExposureOffset(
-        expOffset.clamp(_minExposure, _maxExposure),
-      );
-    } catch (_) {}
+    if (_loadedImageBytes == null && _controller != null) {
+      try {
+        final double norm = _brightness / 10.0;
+        final double expOffset = norm >= 0
+            ? norm * _maxExposure * 0.7
+            : -norm * _minExposure * 0.7;
+        await _controller!.setExposureOffset(
+          expOffset.clamp(_minExposure, _maxExposure),
+        );
+      } catch (_) {}
+    }
   }
 
   void _updateSharpness(double newValue) {
@@ -299,78 +782,405 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() {
       _currentZoom = clamped;
     });
-    try {
-      await _controller.setZoomLevel(clamped);
-    } catch (_) {}
+    if (_loadedImageBytes == null && _controller != null) {
+      try {
+        await _controller!.setZoomLevel(clamped);
+      } catch (_) {}
+    }
   }
 
-  Future<void> _toggleFocusLock() async {
+  // ==========================================================================
+  // ЗАГРУЗКА СУЩЕСТВУЮЩЕГО ФОТО ИЗ ГАЛЕРЕИ ИЛИ СЪЕМКА С КАМЕРЫ
+  // ==========================================================================
+  Future<void> _pickImageFromGallery() async {
+    FocusManager.instance.primaryFocus?.unfocus();
     try {
-      final newLockState = !_isFocusLocked;
-      await _controller.setFocusMode(
-        newLockState ? FocusMode.locked : FocusMode.auto,
+      final XFile? picked = await _picker.pickImage(
+        source: ImageSource.gallery,
       );
-      setState(() {
-        _isFocusLocked = newLockState;
-      });
+      if (picked == null) return;
+
+      setState(() => _isProcessing = true);
+      final Uint8List bytes = await File(picked.path).readAsBytes();
+      await _setLoadedPhoto(bytes);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ошибка загрузки из галереи: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  Future<void> _setLoadedPhoto(Uint8List bytes) async {
+    final ui.Codec codec = await ui.instantiateImageCodec(bytes);
+    final ui.FrameInfo frame = await codec.getNextFrame();
+
+    setState(() {
+      _loadedImageBytes = bytes;
+      _loadedImageWidth = frame.image.width;
+      _loadedImageHeight = frame.image.height;
+      _capsules = [];
+      _multiPassAverageCount = null;
+      _lastMultiPassDetails = [];
+      _currentZoom = 1.0;
+    });
+  }
+
+  // Возврат в режим живой камеры
+  void _returnToLiveCamera() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() {
+      _loadedImageBytes = null;
+      _capsules = [];
+      _multiPassAverageCount = null;
+      _lastMultiPassDetails = [];
+      _manualEditCapsules = false;
+    });
+  }
+
+  // Получение текущего кадра (либо загруженное фото, либо снимок с камеры)
+  Future<Uint8List?> _obtainCurrentImageBytes() async {
+    if (_loadedImageBytes != null) {
+      return _loadedImageBytes;
+    }
+    if (_controller != null && _isCameraInitialized) {
+      final XFile rawFile = await _controller!.takePicture();
+      final Uint8List bytes = await File(rawFile.path).readAsBytes();
+      await _setLoadedPhoto(bytes);
+      return bytes;
+    }
+    return null;
+  }
+
+  // ==========================================================================
+  // БЫСТРЫЙ ПОДСЧЕТ И МУЛЬТИ-РАСЧЕТ КАПСУЛ ПО НЕСКОЛЬКИМ ЯРКОСТЯМ И ЧЕТКОСТЯМ
+  // ==========================================================================
+  Future<void> _runCapsuleDetection({
+    required List<double> brightnessValues,
+    required List<double> sharpnessValues,
+  }) async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    if (_isProcessing) return;
+    setState(() => _isProcessing = true);
+
+    try {
+      final Uint8List? sourceBytes = await _obtainCurrentImageBytes();
+      if (sourceBytes == null) return;
+
+      // Масштабируем изображение до рабочей ширины 320 пикс для быстрого преобразования Хафа
+      const int workWidth = 320;
+      final int workHeight =
+          ((workWidth * _loadedImageHeight) / _loadedImageWidth).round().clamp(
+            180,
+            640,
+          );
+
+      final ui.Codec codec = await ui.instantiateImageCodec(
+        sourceBytes,
+        targetWidth: workWidth,
+        targetHeight: workHeight,
+      );
+      final ui.FrameInfo frame = await codec.getNextFrame();
+      final ByteData? rgbaData = await frame.image.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      );
+
+      if (rgbaData == null) return;
+
+      final task = MultiPassTask(
+        rgbaBytes: Uint8List.fromList(rgbaData.buffer.asUint8List()),
+        width: frame.image.width,
+        height: frame.image.height,
+        brightnessList: brightnessValues,
+        sharpnessList: sharpnessValues,
+        filterIndex: _selectedFilter.index,
+        minRadiusPx: _minCapsuleRadiusPx,
+        maxRadiusPx: _maxCapsuleRadiusPx,
+        sensitivity: _detectionSensitivity,
+      );
+
+      // Запускаем распознавание в фоновом потоке (Isolate)
+      final MultiPassResult result = await compute(_runMultiPassIsolate, task);
+
       if (!mounted) return;
+      setState(() {
+        _capsules = List<DetectedCapsule>.from(result.bestCapsules);
+        _multiPassAverageCount = result.averageCount;
+        _lastMultiPassDetails = result.passes;
+        _showCapsuleOverlay = true;
+        // Применяем оптимальную пару (Яркость, Четкость), давшую самый близкий к среднему результат
+        _brightness = result.bestBrightness;
+        _sharpness = result.bestSharpness;
+      });
+
+      final stats = _getDiameterStatsMicrons();
+      final bool isMulti = result.passes.length > 1;
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          duration: const Duration(seconds: 1),
+          duration: const Duration(seconds: 3),
+          backgroundColor: Colors.teal.shade800,
           content: Text(
-            newLockState
-                ? 'Фокус ЗАБЛОКИРОВАН (настраивайте резкость микроскопом)'
-                : 'Автофокус ВКЛЮЧЕН',
+            isMulti
+                ? 'Мульти-расчет (${result.passes.length} проходов): Среднее = ${result.averageCount.toStringAsFixed(1)} шт. '
+                      '(выбрано: ${_capsules.length} шт.) | Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм'
+                : 'Найдено капсул: ${_capsules.length} шт. | Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм',
           ),
         ),
       );
-    } catch (_) {}
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Ошибка подсчета капсул: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
   }
 
-  Future<void> _onTapPreview(
-    TapDownDetails details,
-    BoxConstraints constraints,
-  ) async {
-    if (FocusScope.of(context).hasFocus) {
-      FocusScope.of(context).unfocus();
+  // Парсинг строки значений через пробел (как в CapsuleCounter)
+  List<double> _parseSpaceSeparatedNumbers(
+    String input,
+    double minVal,
+    double maxVal,
+    double fallback,
+  ) {
+    final parts = input
+        .replaceAll(',', '.')
+        .split(RegExp(r'\s+'))
+        .where((s) => s.trim().isNotEmpty);
+    final List<double> res = [];
+    for (final p in parts) {
+      final v = double.tryParse(p);
+      if (v != null) {
+        res.add(double.parse(v.clamp(minVal, maxVal).toStringAsFixed(1)));
+      }
     }
+    return res.isEmpty ? [fallback] : res;
+  }
 
-    final offset = Offset(
-      (details.localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0),
-      (details.localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0),
+  // Диалог настройки Мульти-расчета (ввод нескольких яркостей и четкостей + просмотр отчета)
+  Future<void> _openMultiPassDialog() async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    final TextEditingController bCtrl = TextEditingController(
+      text: _multiBrightnessInput,
+    );
+    final TextEditingController sCtrl = TextEditingController(
+      text: _multiSharpnessInput,
     );
 
-    setState(() {
-      _focusPoint = details.localPosition;
-    });
+    int tempMinR = _minCapsuleRadiusPx;
+    int tempMaxR = _maxCapsuleRadiusPx;
+    double tempSens = _detectionSensitivity;
 
-    try {
-      await _controller.setFocusPoint(offset);
-      await _controller.setExposurePoint(offset);
-      await _controller.setFocusMode(FocusMode.locked);
-      setState(() {
-        _isFocusLocked = true;
-      });
-    } catch (_) {}
+    final bool? shouldRun = await showDialog<bool>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            title: const Text(
+              'Мульти-расчет капсул',
+              style: TextStyle(fontSize: 17),
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Введите несколько значений через пробел. Программа рассчитает количество капсул для каждой комбинации и найдет среднее:',
+                    style: TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: bCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Значения Яркости (через пробел)',
+                      hintText: '-1.0 0.0 0.5 1.5',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: sCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'Значения Четкости (через пробел)',
+                      hintText: '1.0 2.0 3.0',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: () {
+                        final b1 = (_brightness - 0.5)
+                            .clamp(-10.0, 10.0)
+                            .toStringAsFixed(1);
+                        final b2 = _brightness.toStringAsFixed(1);
+                        final b3 = (_brightness + 0.5)
+                            .clamp(-10.0, 10.0)
+                            .toStringAsFixed(1);
 
-    Future.delayed(const Duration(seconds: 2), () {
-      if (mounted) {
-        setState(() {
-          _focusPoint = null;
-        });
-      }
-    });
+                        final s1 = (_sharpness - 0.5)
+                            .clamp(0.0, 10.0)
+                            .toStringAsFixed(1);
+                        final s2 = _sharpness.toStringAsFixed(1);
+                        final s3 = (_sharpness + 0.5)
+                            .clamp(0.0, 10.0)
+                            .toStringAsFixed(1);
+
+                        setDialogState(() {
+                          bCtrl.text = '$b1 $b2 $b3';
+                          sCtrl.text = '$s1 $s2 $s3';
+                        });
+                      },
+                      icon: const Icon(
+                        Icons.grid_view,
+                        size: 15,
+                        color: Colors.cyanAccent,
+                      ),
+                      label: const Text(
+                        'Заполнить вокруг текущих (±0.5)',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.cyanAccent,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const Divider(),
+                  Text(
+                    'Радиус капсул на матрице: $tempMinR – $tempMaxR пикс.',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  RangeSlider(
+                    values: RangeValues(
+                      tempMinR.toDouble(),
+                      tempMaxR.toDouble(),
+                    ),
+                    min: 4,
+                    max: 90,
+                    divisions: 86,
+                    activeColor: Colors.cyanAccent,
+                    labels: RangeLabels('$tempMinR px', '$tempMaxR px'),
+                    onChanged: (vals) {
+                      setDialogState(() {
+                        tempMinR = vals.start.round();
+                        tempMaxR = math.max(tempMinR + 2, vals.end.round());
+                      });
+                    },
+                  ),
+                  Text(
+                    'Чувствительность контуров: ${(tempSens * 100).round()}%',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  Slider(
+                    value: tempSens,
+                    min: 0.2,
+                    max: 0.95,
+                    activeColor: Colors.amberAccent,
+                    onChanged: (val) => setDialogState(() => tempSens = val),
+                  ),
+                  if (_lastMultiPassDetails.isNotEmpty) ...[
+                    const Divider(),
+                    Text(
+                      'Последний мульти-расчет (Среднее: ${_multiPassAverageCount?.toStringAsFixed(1)} шт.):',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.cyanAccent,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 100),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _lastMultiPassDetails.length,
+                        itemBuilder: (context, idx) {
+                          final p = _lastMultiPassDetails[idx];
+                          return Text(
+                            '• Ярк: ${p.brightness.toStringAsFixed(1)} | Четк: ${p.sharpness.toStringAsFixed(1)}  →  ${p.capsules.length} капсул',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.white70,
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Отмена'),
+              ),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.cyanAccent,
+                  foregroundColor: Colors.black,
+                ),
+                onPressed: () => Navigator.pop(context, true),
+                icon: const Icon(Icons.analytics, size: 18),
+                label: const Text('Рассчитать среднее'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (shouldRun == true) {
+      _multiBrightnessInput = bCtrl.text.trim();
+      _multiSharpnessInput = sCtrl.text.trim();
+      _minCapsuleRadiusPx = tempMinR;
+      _maxCapsuleRadiusPx = tempMaxR;
+      _detectionSensitivity = tempSens;
+
+      final bList = _parseSpaceSeparatedNumbers(
+        _multiBrightnessInput,
+        -10.0,
+        10.0,
+        _brightness,
+      );
+      final sList = _parseSpaceSeparatedNumbers(
+        _multiSharpnessInput,
+        0.0,
+        10.0,
+        _sharpness,
+      );
+
+      await _runCapsuleDetection(
+        brightnessValues: bList,
+        sharpnessValues: sList,
+      );
+    }
   }
 
+  // АВТОНАСТРОЙКА яркости и четкости (работает и для камеры, и для загруженного фото!)
   Future<void> _autoTuneImage() async {
     FocusManager.instance.primaryFocus?.unfocus();
     if (_isProcessing) return;
     setState(() => _isProcessing = true);
 
     try {
-      await _controller.setExposureOffset(0.0);
-      final XFile sampleFile = await _controller.takePicture();
-      final Uint8List bytes = await File(sampleFile.path).readAsBytes();
+      Uint8List? bytes = _loadedImageBytes;
+      if (bytes == null && _controller != null && _isCameraInitialized) {
+        await _controller!.setExposureOffset(0.0);
+        final XFile sampleFile = await _controller!.takePicture();
+        bytes = await File(sampleFile.path).readAsBytes();
+      }
+      if (bytes == null) return;
 
       final ui.Codec codec = await ui.instantiateImageCodec(
         bytes,
@@ -394,7 +1204,7 @@ class _CameraScreenState extends State<CameraScreen> {
         final double cx = width / 2.0;
         final double cy = height / 2.0;
         final double maxRadiusSq = math
-            .pow(math.min(width, height) * 0.35, 2)
+            .pow(math.min(width, height) * 0.38, 2)
             .toDouble();
 
         for (int y = 0; y < height; y++) {
@@ -456,6 +1266,102 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  Future<void> _toggleFocusLock() async {
+    if (_controller == null || !_isCameraInitialized) return;
+    try {
+      final newLockState = !_isFocusLocked;
+      await _controller!.setFocusMode(
+        newLockState ? FocusMode.locked : FocusMode.auto,
+      );
+      setState(() {
+        _isFocusLocked = newLockState;
+      });
+    } catch (_) {}
+  }
+
+  // Нажатие по экрану: либо ручное добавление/удаление капсулы, либо фокусировка камеры
+  Future<void> _onTapViewport(TapDownDetails details, Size viewSize) async {
+    if (FocusScope.of(context).hasFocus) {
+      FocusScope.of(context).unfocus();
+      return;
+    }
+
+    final double tapXNorm = (details.localPosition.dx / viewSize.width).clamp(
+      0.0,
+      1.0,
+    );
+    final double tapYNorm = (details.localPosition.dy / viewSize.height).clamp(
+      0.0,
+      1.0,
+    );
+
+    // Если включен режим ручной правки капсул на снимке
+    if (_manualEditCapsules && _loadedImageBytes != null) {
+      final double aspect = viewSize.height / viewSize.width;
+      int hitIndex = -1;
+
+      for (int i = 0; i < _capsules.length; i++) {
+        final c = _capsules[i];
+        final dx = tapXNorm - c.cxNorm;
+        final dy = (tapYNorm - c.cyNorm) * aspect;
+        if (math.sqrt(dx * dx + dy * dy) <= c.rNorm * 1.15) {
+          hitIndex = i;
+          break;
+        }
+      }
+
+      setState(() {
+        if (hitIndex >= 0) {
+          // Удаляем лишнюю капсулу при нажатии на неё
+          _capsules.removeAt(hitIndex);
+        } else {
+          // Добавляем капсулу со средним радиусом
+          double defaultRNorm = 0.04;
+          if (_capsules.isNotEmpty) {
+            defaultRNorm =
+                _capsules.map((e) => e.rNorm).reduce((a, b) => a + b) /
+                _capsules.length;
+          }
+          _capsules.add(
+            DetectedCapsule(
+              cxNorm: tapXNorm,
+              cyNorm: tapYNorm,
+              rNorm: defaultRNorm,
+            ),
+          );
+        }
+      });
+      return;
+    }
+
+    // Иначе — фокусировка живой камеры
+    if (_loadedImageBytes == null &&
+        _controller != null &&
+        _isCameraInitialized) {
+      setState(() {
+        _focusPoint = details.localPosition;
+      });
+
+      try {
+        final offset = Offset(tapXNorm, tapYNorm);
+        await _controller!.setFocusPoint(offset);
+        await _controller!.setExposurePoint(offset);
+        await _controller!.setFocusMode(FocusMode.locked);
+        setState(() {
+          _isFocusLocked = true;
+        });
+      } catch (_) {}
+
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted) {
+          setState(() {
+            _focusPoint = null;
+          });
+        }
+      });
+    }
+  }
+
   Future<void> _editSubstanceDialog() async {
     FocusManager.instance.primaryFocus?.unfocus();
     final TextEditingController textCtrl = TextEditingController(
@@ -469,8 +1375,8 @@ class _CameraScreenState extends State<CameraScreen> {
           controller: textCtrl,
           autofocus: true,
           decoration: const InputDecoration(
-            labelText: 'Название вещества / препарата',
-            hintText: 'Например: Кристалл NaCl, Кровь',
+            labelText: 'Название образца / капсул',
+            hintText: 'Например: Микрокапсулы альгината',
           ),
         ),
         actions: [
@@ -493,7 +1399,6 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // Диалог выбора и сохранения кастомного увеличения
   Future<void> _editMagnificationDialog() async {
     FocusManager.instance.primaryFocus?.unfocus();
     final TextEditingController customCtrl = TextEditingController();
@@ -528,7 +1433,6 @@ class _CameraScreenState extends State<CameraScreen> {
             const SizedBox(height: 16),
             TextField(
               controller: customCtrl,
-              keyboardType: TextInputType.text,
               decoration: const InputDecoration(
                 labelText: 'Свое значение (например: 60x)',
                 border: OutlineInputBorder(),
@@ -566,11 +1470,12 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  Future<void> _takePicture() async {
+  // Сохранение итогового изображения (с камеры или отредактированного фото из галереи)
+  Future<void> _captureOrSaveImage() async {
     FocusManager.instance.primaryFocus?.unfocus();
-    if (_isProcessing || !_isCameraInitialized) return;
+    if (_isProcessing) return;
 
-    if (_useTimer) {
+    if (_loadedImageBytes == null && _useTimer) {
       for (int i = 3; i > 0; i--) {
         if (!mounted) return;
         setState(() => _countdown = i);
@@ -583,14 +1488,14 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() => _isProcessing = true);
 
     try {
-      final XFile rawFile = await _controller.takePicture();
-      final Uint8List rawBytes = await File(rawFile.path).readAsBytes();
+      final Uint8List? rawBytes = await _obtainCurrentImageBytes();
+      if (rawBytes == null) return;
 
       final Uint8List processedBytes = await _processAndStampImage(rawBytes);
 
       final Directory tempDir = await getTemporaryDirectory();
       final String outPath =
-          '${tempDir.path}/micro_${DateTime.now().millisecondsSinceEpoch}.png';
+          '${tempDir.path}/capsules_${DateTime.now().millisecondsSinceEpoch}.png';
       final File outFile = File(outPath);
       await outFile.writeAsBytes(processedBytes);
 
@@ -604,7 +1509,7 @@ class _CameraScreenState extends State<CameraScreen> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           backgroundColor: Colors.green.shade800,
-          content: Text('Снимок «$_substanceName ($_magnification)» сохранен!'),
+          content: Text('Сохранено в галерею! Капсул: ${_capsules.length} шт.'),
         ),
       );
     } catch (e) {
@@ -616,6 +1521,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  // Отрисовка фильтров, распознанных капсул, их диаметров и лабораторного штампа
   Future<Uint8List> _processAndStampImage(Uint8List inputBytes) async {
     final ui.Codec codec = await ui.instantiateImageCodec(inputBytes);
     final ui.FrameInfo frame = await codec.getNextFrame();
@@ -630,95 +1536,145 @@ class _CameraScreenState extends State<CameraScreen> {
       Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
     );
 
+    // 1. Отрисовка снимка с выбранной яркостью, четкостью и оптическим фильтром
     final Paint imagePaint = Paint()
       ..colorFilter = _buildColorFilter(isFinalCapture: true)
       ..filterQuality = FilterQuality.high;
     canvas.drawImage(srcImage, Offset.zero, imagePaint);
 
+    final double scaleUm = _getScaleMicrons();
+
+    // 2. Отрисовка распознанных капсул и их диаметров на снимке
+    if (_showCapsuleOverlay && _capsules.isNotEmpty) {
+      final Paint circlePaint = Paint()
+        ..color = Colors.greenAccent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = math.max(2.5, w * 0.0035);
+
+      final Paint centerPaint = Paint()
+        ..color = Colors.amberAccent
+        ..style = PaintingStyle.fill;
+
+      for (int i = 0; i < _capsules.length; i++) {
+        final c = _capsules[i];
+        final double cx = c.cxNorm * w;
+        final double cy = c.cyNorm * h;
+        final double r = c.rNorm * w;
+        final double diamUm = c.diameterMicrons(scaleUm);
+
+        canvas.drawCircle(Offset(cx, cy), r, circlePaint);
+        canvas.drawCircle(
+          Offset(cx, cy),
+          math.max(2.0, w * 0.004),
+          centerPaint,
+        );
+
+        final TextPainter tp = TextPainter(
+          text: TextSpan(
+            text: '#${i + 1} (${diamUm.toStringAsFixed(0)} мкм)',
+            style: TextStyle(
+              color: Colors.yellowAccent,
+              fontSize: math.max(11.0, w * 0.020),
+              fontWeight: FontWeight.bold,
+              backgroundColor: const Color.fromRGBO(0, 0, 0, 0.65),
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+
+        tp.paint(canvas, Offset(cx - tp.width / 2, cy - r - tp.height - 2));
+      }
+    }
+
+    // 3. Формирование 4 строк лабораторного штампа (включая подсчет капсул и средний диаметр)
     final DateTime now = DateTime.now();
     final String dateStr =
         '${now.day.toString().padLeft(2, '0')}.${now.month.toString().padLeft(2, '0')}.${now.year} '
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
+    final stats = _getDiameterStatsMicrons();
+    final String avgText = _multiPassAverageCount != null
+        ? ' (Ср. мульти: ${_multiPassAverageCount!.toStringAsFixed(1)})'
+        : '';
+
     final String line1Title = '$_substanceName  |  Увеличение: $_magnification';
-    final String line2Params =
+    final String line2Capsules = _capsules.isNotEmpty
+        ? 'Капсул: ${_capsules.length} шт.$avgText  |  Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм [${stats['min']!.toStringAsFixed(0)}–${stats['max']!.toStringAsFixed(0)} мкм]'
+        : 'Капсулы: подсчет не проводился';
+    final String line3Params =
         'Фильтр: ${_selectedFilter.title}  |  Ярк: ${_brightness.toStringAsFixed(1)}  |  Четк: ${_sharpness.toStringAsFixed(1)}';
-    final String line3Date = 'Дата съемки: $dateStr';
+    final String line4Date = 'Дата съемки: $dateStr';
 
     final double textMaxWidth = w * 0.70;
-    final double titleFontSize = w * 0.036;
-    final double subFontSize = w * 0.025;
+    final double titleFontSize = w * 0.033;
+    final double subFontSize = w * 0.023;
 
-    final TextPainter titlePainter = TextPainter(
-      text: TextSpan(
-        text: line1Title,
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: titleFontSize,
-          fontWeight: FontWeight.bold,
+    TextPainter buildPainter(
+      String text,
+      double size,
+      Color color, {
+      bool bold = false,
+    }) {
+      return TextPainter(
+        text: TextSpan(
+          text: text,
+          style: TextStyle(
+            color: color,
+            fontSize: size,
+            fontWeight: bold ? FontWeight.bold : FontWeight.normal,
+          ),
         ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout(maxWidth: textMaxWidth);
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: textMaxWidth);
+    }
 
-    final TextPainter paramsPainter = TextPainter(
-      text: TextSpan(
-        text: line2Params,
-        style: TextStyle(color: Colors.white70, fontSize: subFontSize),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout(maxWidth: textMaxWidth);
+    final tp1 = buildPainter(
+      line1Title,
+      titleFontSize,
+      Colors.white,
+      bold: true,
+    );
+    final tp2 = buildPainter(
+      line2Capsules,
+      subFontSize * 1.05,
+      Colors.greenAccent,
+      bold: true,
+    );
+    final tp3 = buildPainter(line3Params, subFontSize, Colors.white70);
+    final tp4 = buildPainter(line4Date, subFontSize * 0.92, Colors.white54);
 
-    final TextPainter datePainter = TextPainter(
-      text: TextSpan(
-        text: line3Date,
-        style: TextStyle(color: Colors.white60, fontSize: subFontSize * 0.95),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout(maxWidth: textMaxWidth);
-
-    final double verticalPadding = h * 0.018;
-    final double lineSpacing = h * 0.006;
+    final double verticalPadding = h * 0.015;
+    final double lineSpacing = h * 0.005;
     final double totalTextHeight =
-        titlePainter.height +
-        paramsPainter.height +
-        datePainter.height +
-        (lineSpacing * 2) +
-        (verticalPadding * 2.4);
+        tp1.height +
+        tp2.height +
+        tp3.height +
+        tp4.height +
+        (lineSpacing * 3) +
+        (verticalPadding * 2.2);
 
-    final double barHeight = math.max(h * 0.105, totalTextHeight);
+    final double barHeight = math.max(h * 0.115, totalTextHeight);
     final double barTop = h - barHeight;
 
-    final Rect barRect = Rect.fromLTWH(0, barTop, w.toDouble(), barHeight);
     canvas.drawRect(
-      barRect,
-      Paint()..color = const Color.fromRGBO(0, 0, 0, 0.80),
+      Rect.fromLTWH(0, barTop, w.toDouble(), barHeight),
+      Paint()..color = const Color.fromRGBO(0, 0, 0, 0.82),
     );
 
     double currentY = barTop + verticalPadding;
-    titlePainter.paint(canvas, Offset(w * 0.03, currentY));
+    tp1.paint(canvas, Offset(w * 0.03, currentY));
+    currentY += tp1.height + lineSpacing;
 
-    currentY += titlePainter.height + lineSpacing;
-    paramsPainter.paint(canvas, Offset(w * 0.03, currentY));
+    tp2.paint(canvas, Offset(w * 0.03, currentY));
+    currentY += tp2.height + lineSpacing;
 
-    currentY += paramsPainter.height + lineSpacing;
-    datePainter.paint(canvas, Offset(w * 0.03, currentY));
+    tp3.paint(canvas, Offset(w * 0.03, currentY));
+    currentY += tp3.height + lineSpacing;
 
-    String scaleLabel = '50 мкм';
-    final int cleanMag =
-        int.tryParse(_magnification.replaceAll(RegExp(r'[^0-9]'), '')) ?? 40;
-    if (cleanMag <= 5) {
-      scaleLabel = '500 мкм';
-    } else if (cleanMag <= 15) {
-      scaleLabel = '200 мкм';
-    } else if (cleanMag <= 30) {
-      scaleLabel = '100 мкм';
-    } else if (cleanMag <= 60) {
-      scaleLabel = '50 мкм';
-    } else {
-      scaleLabel = '20 мкм';
-    }
+    tp4.paint(canvas, Offset(w * 0.03, currentY));
 
+    // 4. Калибровочная линейка в правом нижнем углу
+    final String scaleLabel = '${scaleUm.toInt()} мкм';
     final double scaleBarWidth = w * 0.20;
     final double scaleRight = w * 0.96;
     final double scaleLeft = scaleRight - scaleBarWidth;
@@ -734,13 +1690,13 @@ class _CameraScreenState extends State<CameraScreen> {
       scalePaint,
     );
     canvas.drawLine(
-      Offset(scaleLeft, scaleY - barHeight * 0.10),
-      Offset(scaleLeft, scaleY + barHeight * 0.10),
+      Offset(scaleLeft, scaleY - barHeight * 0.09),
+      Offset(scaleLeft, scaleY + barHeight * 0.09),
       scalePaint,
     );
     canvas.drawLine(
-      Offset(scaleRight, scaleY - barHeight * 0.10),
-      Offset(scaleRight, scaleY + barHeight * 0.10),
+      Offset(scaleRight, scaleY - barHeight * 0.09),
+      Offset(scaleRight, scaleY + barHeight * 0.09),
       scalePaint,
     );
 
@@ -749,7 +1705,7 @@ class _CameraScreenState extends State<CameraScreen> {
         text: scaleLabel,
         style: TextStyle(
           color: Colors.cyanAccent,
-          fontSize: titleFontSize * 0.85,
+          fontSize: titleFontSize * 0.82,
           fontWeight: FontWeight.bold,
         ),
       ),
@@ -760,7 +1716,7 @@ class _CameraScreenState extends State<CameraScreen> {
       canvas,
       Offset(
         scaleLeft + (scaleBarWidth - scaleTextPainter.width) / 2,
-        scaleY - scaleTextPainter.height - (barHeight * 0.12),
+        scaleY - scaleTextPainter.height - (barHeight * 0.11),
       ),
     );
 
@@ -775,18 +1731,18 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_isCameraInitialized) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
+    final bool isPhotoMode = _loadedImageBytes != null;
+    final diameterStats = _getDiameterStatsMicrons();
+    final double scaleUm = _getScaleMicrons();
 
     return Scaffold(
       resizeToAvoidBottomInset: true,
       body: SafeArea(
         child: Column(
           children: [
-            // 1. ВЕРХНЯЯ ПАНЕЛЬ
+            // 1. ВЕРХНЯЯ ПАНЕЛЬ (Название, Увеличение, Галерея, Сетка, Таймер)
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
               color: Colors.black87,
               child: Row(
                 children: [
@@ -810,17 +1766,17 @@ class _CameraScreenState extends State<CameraScreen> {
                               size: 15,
                               color: Colors.cyanAccent,
                             ),
-                            const SizedBox(width: 5),
+                            const SizedBox(width: 4),
                             Expanded(
                               child: Text(
                                 _substanceName,
                                 overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(fontSize: 13),
+                                style: const TextStyle(fontSize: 12),
                               ),
                             ),
                             const Icon(
                               Icons.edit,
-                              size: 13,
+                              size: 12,
                               color: Colors.white54,
                             ),
                           ],
@@ -828,14 +1784,14 @@ class _CameraScreenState extends State<CameraScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 6),
-                  // Кнопка выпадающего списка с кастомным вводом и сохранением
+                  const SizedBox(width: 5),
+                  // Выбор/ввод увеличения
                   InkWell(
                     onTap: _editMagnificationDialog,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 6,
+                        horizontal: 7,
+                        vertical: 5,
                       ),
                       decoration: BoxDecoration(
                         color: Colors.white10,
@@ -851,57 +1807,134 @@ class _CameraScreenState extends State<CameraScreen> {
                             style: const TextStyle(
                               color: Colors.amberAccent,
                               fontWeight: FontWeight.bold,
-                              fontSize: 13,
+                              fontSize: 12,
                             ),
                           ),
-                          const SizedBox(width: 4),
                           const Icon(
                             Icons.arrow_drop_down,
                             color: Colors.amberAccent,
-                            size: 18,
+                            size: 16,
                           ),
                         ],
                       ),
                     ),
                   ),
-                  TextButton(
-                    style: TextButton.styleFrom(
-                      minimumSize: const Size(40, 32),
-                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                  const SizedBox(width: 4),
+                  // Кнопка загрузки существующего фото из галереи
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: 'Загрузить фото из галереи',
+                    icon: const Icon(
+                      Icons.photo_library,
+                      size: 20,
+                      color: Colors.cyanAccent,
                     ),
-                    onPressed: () => setState(() => _isWide9x16 = !_isWide9x16),
-                    child: Text(
-                      _isWide9x16 ? '9:16' : '3:4',
-                      style: const TextStyle(
-                        color: Colors.cyanAccent,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                      ),
-                    ),
+                    onPressed: _pickImageFromGallery,
                   ),
+                  // Если открыто фото — кнопка возврата к живой камере
+                  if (isPhotoMode)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: 'Вернуться к живой камере',
+                      icon: const Icon(
+                        Icons.videocam,
+                        size: 22,
+                        color: Colors.greenAccent,
+                      ),
+                      onPressed: _returnToLiveCamera,
+                    ),
                   IconButton(
                     visualDensity: VisualDensity.compact,
                     icon: Icon(
                       Icons.grid_on,
-                      size: 20,
+                      size: 19,
                       color: _showGrid ? Colors.cyanAccent : Colors.white38,
                     ),
                     onPressed: () => setState(() => _showGrid = !_showGrid),
-                  ),
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: Icon(
-                      Icons.timer,
-                      size: 20,
-                      color: _useTimer ? Colors.orangeAccent : Colors.white38,
-                    ),
-                    onPressed: () => setState(() => _useTimer = !_useTimer),
                   ),
                 ],
               ),
             ),
 
-            // 2. ОБЛАСТЬ КАМЕРЫ
+            // 2. ПАНЕЛЬ СТАТИСТИКИ КАПСУЛ И ДИАМЕТРОВ
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              color: Colors.grey.shade900,
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.bubble_chart,
+                    size: 16,
+                    color: Colors.greenAccent,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      _capsules.isEmpty
+                          ? (isPhotoMode
+                                ? 'Фото загружено. Нажмите «Считать» или «Мульти» для поиска капсул'
+                                : 'Режим камеры (нажмите «Галерея» или «Считать»)')
+                          : 'Капсул: ${_capsules.length} шт.${_multiPassAverageCount != null ? " (Ср: ${_multiPassAverageCount!.toStringAsFixed(1)})" : ""}  |  '
+                                'Ø ср: ${diameterStats['mean']!.toStringAsFixed(1)} мкм '
+                                '[${diameterStats['min']!.toStringAsFixed(0)}–${diameterStats['max']!.toStringAsFixed(0)}]',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: _capsules.isEmpty
+                            ? Colors.white70
+                            : Colors.greenAccent,
+                      ),
+                    ),
+                  ),
+                  if (isPhotoMode) ...[
+                    // Переключатель ручного добавления/удаления капсул пальцем
+                    InkWell(
+                      onTap: () => setState(
+                        () => _manualEditCapsules = !_manualEditCapsules,
+                      ),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _manualEditCapsules
+                              ? Colors.amberAccent
+                              : Colors.white12,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          _manualEditCapsules ? 'Правка: ВКЛ' : 'Правка',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: _manualEditCapsules
+                                ? Colors.black
+                                : Colors.white70,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    InkWell(
+                      onTap: () => setState(
+                        () => _showCapsuleOverlay = !_showCapsuleOverlay,
+                      ),
+                      child: Icon(
+                        _showCapsuleOverlay
+                            ? Icons.visibility
+                            : Icons.visibility_off,
+                        size: 16,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+
+            // 3. ОБЛАСТЬ ИЗОБРАЖЕНИЯ (Живая камера ИЛИ загруженное фото из галереи)
             Expanded(
               child: Center(
                 child: LayoutBuilder(
@@ -914,38 +1947,82 @@ class _CameraScreenState extends State<CameraScreen> {
                             viewWidth * (4.0 / 3.0),
                           );
 
-                    final double previewAspectRatio =
-                        1.0 / _controller.value.aspectRatio;
-
                     return SizedBox(
                       width: viewWidth,
                       height: viewHeight,
                       child: ClipRect(
                         child: GestureDetector(
-                          onTapDown: (details) => _onTapPreview(
+                          onTapDown: (details) => _onTapViewport(
                             details,
-                            BoxConstraints(
-                              maxWidth: viewWidth,
-                              maxHeight: viewHeight,
-                            ),
+                            Size(viewWidth, viewHeight),
                           ),
                           child: Stack(
                             alignment: Alignment.center,
                             children: [
-                              SizedBox.expand(
-                                child: FittedBox(
-                                  fit: BoxFit.cover,
+                              // A) Режим редактирования и анализа загруженного фото
+                              if (isPhotoMode)
+                                Transform.scale(
+                                  scale: _currentZoom,
                                   child: SizedBox(
                                     width: viewWidth,
-                                    height: viewWidth / previewAspectRatio,
+                                    height: viewHeight,
                                     child: ColorFiltered(
                                       colorFilter: _buildColorFilter(),
-                                      child: CameraPreview(_controller),
+                                      child: Image.memory(
+                                        _loadedImageBytes!,
+                                        fit: BoxFit.fill,
+                                        gaplessPlayback: true,
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              // B) Режим живой камеры
+                              else if (_isCameraInitialized &&
+                                  _controller != null)
+                                SizedBox.expand(
+                                  child: FittedBox(
+                                    fit: BoxFit.cover,
+                                    child: SizedBox(
+                                      width: viewWidth,
+                                      height:
+                                          viewWidth *
+                                          _controller!.value.aspectRatio,
+                                      child: ColorFiltered(
+                                        colorFilter: _buildColorFilter(),
+                                        child: CameraPreview(_controller!),
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              else
+                                Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    const CircularProgressIndicator(),
+                                    const SizedBox(height: 12),
+                                    ElevatedButton.icon(
+                                      onPressed: _pickImageFromGallery,
+                                      icon: const Icon(Icons.photo_library),
+                                      label: const Text(
+                                        'Открыть фото из галереи',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+
+                              // Слой отрисовки распознанных капсул и их диаметров
+                              if (_showCapsuleOverlay && _capsules.isNotEmpty)
+                                IgnorePointer(
+                                  child: CustomPaint(
+                                    size: Size(viewWidth, viewHeight),
+                                    painter: CapsuleOverlayPainter(
+                                      capsules: _capsules,
+                                      scaleMicrons: scaleUm,
                                     ),
                                   ),
                                 ),
-                              ),
 
+                              // Прицельная лабораторная сетка
                               if (_showGrid)
                                 IgnorePointer(
                                   child: CustomPaint(
@@ -990,15 +2067,16 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
 
-            // 3. НИЖНЯЯ ПАНЕЛЬ УПРАВЛЕНИЯ
+            // 4. НИЖНЯЯ ПАНЕЛЬ УПРАВЛЕНИЯ (Фильтры, Зум, Спинбоксы, Подсчет капсул)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
               color: Colors.black87,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  // Оптические фильтры (работают и на камере, и на загруженном фото!)
                   SizedBox(
-                    height: 30,
+                    height: 28,
                     child: ListView.separated(
                       scrollDirection: Axis.horizontal,
                       itemCount: LabFilter.values.length,
@@ -1029,15 +2107,16 @@ class _CameraScreenState extends State<CameraScreen> {
                       },
                     ),
                   ),
-                  const SizedBox(height: 4),
+                  const SizedBox(height: 3),
 
+                  // Ползунок зума
                   SizedBox(
-                    height: 26,
+                    height: 24,
                     child: Row(
                       children: [
                         const Icon(
                           Icons.zoom_in,
-                          size: 16,
+                          size: 15,
                           color: Colors.white70,
                         ),
                         const SizedBox(width: 4),
@@ -1058,6 +2137,7 @@ class _CameraScreenState extends State<CameraScreen> {
                     ),
                   ),
 
+                  // Спинбоксы Яркости и Четкости (шаг 0.1 + ручной ввод) + АВТО
                   Row(
                     children: [
                       Expanded(
@@ -1089,7 +2169,7 @@ class _CameraScreenState extends State<CameraScreen> {
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.teal.shade700,
                           foregroundColor: Colors.white,
-                          minimumSize: const Size(52, 36),
+                          minimumSize: const Size(48, 34),
                           padding: const EdgeInsets.symmetric(horizontal: 8),
                         ),
                         child: const Text(
@@ -1104,79 +2184,137 @@ class _CameraScreenState extends State<CameraScreen> {
                   ),
                   const SizedBox(height: 6),
 
+                  // Нижний ряд: Считать капсулы | Мульти-расчет | Съемка/Сохранение | Галерея/Сброс
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      OutlinedButton.icon(
-                        onPressed: _toggleFocusLock,
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: _isFocusLocked
-                              ? Colors.amberAccent
-                              : Colors.white,
-                          side: BorderSide(
-                            color: _isFocusLocked
-                                ? Colors.amberAccent
-                                : Colors.white38,
-                          ),
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                      // Быстрый подсчет капсул при текущих параметрах
+                      ElevatedButton.icon(
+                        onPressed: _isProcessing
+                            ? null
+                            : () => _runCapsuleDetection(
+                                brightnessValues: [_brightness],
+                                sharpnessValues: [_sharpness],
+                              ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green.shade700,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
                           minimumSize: const Size(0, 36),
                         ),
-                        icon: Icon(
-                          _isFocusLocked
-                              ? Icons.lock
-                              : Icons.center_focus_strong,
-                          size: 16,
-                        ),
-                        label: Text(
-                          _isFocusLocked ? 'Фокус: БЛОК' : 'Фокус: АВТО',
-                          style: const TextStyle(fontSize: 12),
+                        icon: const Icon(Icons.grain, size: 16),
+                        label: const Text(
+                          'Считать',
+                          style: TextStyle(fontSize: 11.5),
                         ),
                       ),
 
+                      // Мульти-расчет (среднее по нескольким яркостям и четкостям)
+                      OutlinedButton.icon(
+                        onPressed: _isProcessing ? null : _openMultiPassDialog,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.cyanAccent,
+                          side: const BorderSide(color: Colors.cyanAccent),
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          minimumSize: const Size(0, 36),
+                        ),
+                        icon: const Icon(Icons.functions, size: 16),
+                        label: const Text(
+                          'Мульти',
+                          style: TextStyle(fontSize: 11.5),
+                        ),
+                      ),
+
+                      // Центральная кнопка: Сделать снимок / Сохранить отчет с капсулами в галерею
                       GestureDetector(
-                        onTap: _isProcessing ? null : _takePicture,
+                        onTap: _isProcessing ? null : _captureOrSaveImage,
                         child: Container(
-                          width: 52,
-                          height: 52,
+                          width: 48,
+                          height: 48,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: _isProcessing ? Colors.grey : Colors.white,
+                            color: _isProcessing
+                                ? Colors.grey
+                                : (isPhotoMode
+                                      ? Colors.cyanAccent
+                                      : Colors.white),
                             border: Border.all(
                               color: Colors.cyanAccent,
-                              width: 3,
+                              width: 2.5,
                             ),
                           ),
                           child: _isProcessing
                               ? const Padding(
                                   padding: EdgeInsets.all(12.0),
                                   child: CircularProgressIndicator(
-                                    strokeWidth: 3,
+                                    strokeWidth: 2.5,
                                     color: Colors.black,
                                   ),
                                 )
-                              : const Icon(
-                                  Icons.camera_alt,
+                              : Icon(
+                                  isPhotoMode
+                                      ? Icons.save_alt
+                                      : Icons.camera_alt,
                                   color: Colors.black,
-                                  size: 26,
+                                  size: 24,
                                 ),
                         ),
                       ),
 
-                      TextButton.icon(
+                      // Фокус (для камеры) или К камере (для фото)
+                      if (!isPhotoMode)
+                        OutlinedButton(
+                          onPressed: _toggleFocusLock,
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: _isFocusLocked
+                                ? Colors.amberAccent
+                                : Colors.white70,
+                            side: BorderSide(
+                              color: _isFocusLocked
+                                  ? Colors.amberAccent
+                                  : Colors.white24,
+                            ),
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            minimumSize: const Size(0, 36),
+                          ),
+                          child: Text(
+                            _isFocusLocked ? 'БЛОК' : 'Фокус',
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        )
+                      else
+                        OutlinedButton(
+                          onPressed: _returnToLiveCamera,
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.amberAccent,
+                            side: const BorderSide(color: Colors.amberAccent),
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            minimumSize: const Size(0, 36),
+                          ),
+                          child: const Text(
+                            'Камера',
+                            style: TextStyle(fontSize: 11),
+                          ),
+                        ),
+
+                      // Сброс параметров и разметки
+                      IconButton(
+                        visualDensity: VisualDensity.compact,
+                        tooltip: 'Сброс настроек',
                         onPressed: () {
                           FocusManager.instance.primaryFocus?.unfocus();
                           _updateBrightness(0.0);
                           _updateSharpness(1.0);
-                          setState(() => _selectedFilter = LabFilter.standard);
+                          setState(() {
+                            _selectedFilter = LabFilter.standard;
+                            _capsules = [];
+                            _multiPassAverageCount = null;
+                          });
                         },
                         icon: const Icon(
                           Icons.refresh,
-                          size: 16,
+                          size: 20,
                           color: Colors.white70,
-                        ),
-                        label: const Text(
-                          'Сброс',
-                          style: TextStyle(color: Colors.white70, fontSize: 12),
                         ),
                       ),
                     ],
@@ -1191,6 +2329,56 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
+// Отрисовщик контуров распознанных капсул и их диаметров в реальном времени
+class CapsuleOverlayPainter extends CustomPainter {
+  final List<DetectedCapsule> capsules;
+  final double scaleMicrons;
+
+  CapsuleOverlayPainter({required this.capsules, required this.scaleMicrons});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint circlePaint = Paint()
+      ..color = Colors.greenAccent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+
+    final Paint centerPaint = Paint()
+      ..color = Colors.amberAccent
+      ..style = PaintingStyle.fill;
+
+    for (int i = 0; i < capsules.length; i++) {
+      final c = capsules[i];
+      final double cx = c.cxNorm * size.width;
+      final double cy = c.cyNorm * size.height;
+      final double r = c.rNorm * size.width;
+      final double diamUm = c.diameterMicrons(scaleMicrons);
+
+      canvas.drawCircle(Offset(cx, cy), r, circlePaint);
+      canvas.drawCircle(Offset(cx, cy), 2.5, centerPaint);
+
+      final TextPainter tp = TextPainter(
+        text: TextSpan(
+          text: '${diamUm.toStringAsFixed(0)} мкм',
+          style: const TextStyle(
+            color: Colors.yellowAccent,
+            fontSize: 10,
+            fontWeight: FontWeight.bold,
+            backgroundColor: Color.fromRGBO(0, 0, 0, 0.6),
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      tp.paint(canvas, Offset(cx - tp.width / 2, cy - r - tp.height - 2));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CapsuleOverlayPainter oldDelegate) => true;
+}
+
+// Спинбокс с поддержкой ручного ввода и шагом 0.1
 class LabSpinBox extends StatefulWidget {
   final String label;
   final double value;
@@ -1273,7 +2461,7 @@ class _LabSpinBoxState extends State<LabSpinBox> {
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 36,
+      height: 34,
       padding: const EdgeInsets.symmetric(horizontal: 6),
       decoration: BoxDecoration(
         color: const Color.fromRGBO(30, 30, 30, 0.95),
@@ -1309,7 +2497,7 @@ class _LabSpinBoxState extends State<LabSpinBox> {
               textInputAction: TextInputAction.done,
               textAlign: TextAlign.center,
               style: const TextStyle(
-                fontSize: 13,
+                fontSize: 12.5,
                 fontWeight: FontWeight.bold,
                 color: Colors.cyanAccent,
               ),
@@ -1346,8 +2534,8 @@ class MicroscopeGridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final Paint paint = Paint()
-      ..color = const Color.fromRGBO(0, 255, 255, 0.45)
-      ..strokeWidth = 1.2
+      ..color = const Color.fromRGBO(0, 255, 255, 0.35)
+      ..strokeWidth = 1.1
       ..style = PaintingStyle.stroke;
 
     final double cx = size.width / 2;
