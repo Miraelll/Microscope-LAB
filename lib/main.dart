@@ -51,18 +51,55 @@ class DetectedCapsule {
   final double cyNorm;
   final double rNorm;
   final double score;
+  final bool isManual;
 
   const DetectedCapsule({
     required this.cxNorm,
     required this.cyNorm,
     required this.rNorm,
     this.score = 1.0,
+    this.isManual = false,
   });
+
+  DetectedCapsule copyWith({
+    double? cxNorm,
+    double? cyNorm,
+    double? rNorm,
+    double? score,
+    bool? isManual,
+  }) {
+    return DetectedCapsule(
+      cxNorm: cxNorm ?? this.cxNorm,
+      cyNorm: cyNorm ?? this.cyNorm,
+      rNorm: rNorm ?? this.rNorm,
+      score: score ?? this.score,
+      isManual: isManual ?? this.isManual,
+    );
+  }
 
   double diameterPx(double imageWidth) => 2.0 * rNorm * imageWidth;
 
   double diameterMicrons(double scaleMicrons) =>
       2.0 * rNorm * (scaleMicrons / 0.20);
+}
+
+// Профиль обучения по положительным (капсулы) и отрицательным (удаленный шум/палочки) образцам
+class LearnedCapsuleProfile {
+  final double targetWallSignal;
+  final double targetHollowDiff;
+  final double maxAllowedSpike;
+  final int minRadiusPx;
+  final int maxRadiusPx;
+  final int trainingCount;
+
+  const LearnedCapsuleProfile({
+    required this.targetWallSignal,
+    required this.targetHollowDiff,
+    required this.maxAllowedSpike,
+    required this.minRadiusPx,
+    required this.maxRadiusPx,
+    this.trainingCount = 1,
+  });
 }
 
 class MultiPassTask {
@@ -78,6 +115,8 @@ class MultiPassTask {
   final double roiCenterXNorm;
   final double roiCenterYNorm;
   final double roiRadiusNorm;
+  final LearnedCapsuleProfile? learnedProfile;
+  final List<Offset> bannedZonesNorm;
 
   const MultiPassTask({
     required this.rgbaBytes,
@@ -92,6 +131,8 @@ class MultiPassTask {
     required this.roiCenterXNorm,
     required this.roiCenterYNorm,
     required this.roiRadiusNorm,
+    this.learnedProfile,
+    this.bannedZonesNorm = const [],
   });
 }
 
@@ -128,7 +169,7 @@ class MultiPassResult {
 }
 
 // ============================================================================
-// ФОНОВЫЙ АЛГОРИТМ ПОИСКА КАПСУЛ (ВЫЧИТАНИЕ ЛОКАЛЬНОГО ФОНА + ИЗОЛЯЦИЯ КОНТУРА)
+// ФОНОВЫЙ АЛГОРИТМ ПОИСКА КАПСУЛ С ЗАЩИТОЙ ОТ ПАЛОЧЕК / ВОЛОКОН (Isolate)
 // ============================================================================
 MultiPassResult _runMultiPassIsolate(MultiPassTask task) {
   final List<SinglePassSummary> passes = [];
@@ -148,6 +189,8 @@ MultiPassResult _runMultiPassIsolate(MultiPassTask task) {
         roiCenterXNorm: task.roiCenterXNorm,
         roiCenterYNorm: task.roiCenterYNorm,
         roiRadiusNorm: task.roiRadiusNorm,
+        learnedProfile: task.learnedProfile,
+        bannedZonesNorm: task.bannedZonesNorm,
       );
       passes.add(
         SinglePassSummary(brightness: b, sharpness: s, capsules: capsules),
@@ -202,13 +245,11 @@ MultiPassResult _runMultiPassIsolate(MultiPassTask task) {
   );
 }
 
-// Быстрое вычисление скользящего локального фона (окно 25x25) для устранения шума и неравномерного света
 Float32List _computeLocalBackground(Float32List src, int w, int h, int radius) {
   final Float32List temp = Float32List(w * h);
   final Float32List out = Float32List(w * h);
   final double invDiam = 1.0 / (2 * radius + 1).toDouble();
 
-  // Горизонтальный проход
   for (int y = 0; y < h; y++) {
     final int rowOffset = y * w;
     double sum = src[rowOffset] * (radius + 1).toDouble();
@@ -223,7 +264,6 @@ Float32List _computeLocalBackground(Float32List src, int w, int h, int radius) {
     }
   }
 
-  // Вертикальный проход
   for (int x = 0; x < w; x++) {
     double sum = temp[x] * (radius + 1).toDouble();
     for (int y = 1; y <= radius; y++) {
@@ -253,6 +293,8 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
   required double roiCenterXNorm,
   required double roiCenterYNorm,
   required double roiRadiusNorm,
+  LearnedCapsuleProfile? learnedProfile,
+  List<Offset> bannedZonesNorm = const [],
 }) {
   final int numPixels = w * h;
   final Float32List rawLum = Float32List(numPixels);
@@ -261,11 +303,9 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
   final double cx = roiCenterXNorm * w.toDouble();
   final double cy = roiCenterYNorm * h.toDouble();
   final double minSide = math.min(w, h).toDouble();
-  // Отступаем 12% внутрь от границы круга сетки, чтобы полностью исключить край окуляра
-  final double effectiveRadius = minSide * roiRadiusNorm * 0.88;
+  final double effectiveRadius = minSide * roiRadiusNorm * 0.89;
   final double maxSearchRadiusSq = effectiveRadius * effectiveRadius;
 
-  // 1. Считываем чистую яркость матрицы и строим маску светлого поля без синей каймы окуляра
   for (int y = 0; y < h; y++) {
     final double dy = y.toDouble() - cy;
     for (int x = 0; x < w; x++) {
@@ -280,18 +320,16 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
       final double lum = 0.299 * r + 0.587 * g + 0.114 * b;
       rawLum[p] = lum;
 
-      // Точка валидна только внутри круга сетки, на светлом фоне и вне синего ореола линзы (b - r < 24)
       if (dx * dx + dy * dy <= maxSearchRadiusSq &&
-          lum > 155.0 &&
-          (b - r) < 24.0) {
+          lum > 148.0 &&
+          (b - r) < 22.0) {
         validMask[p] = 1;
       }
     }
   }
 
-  // Эрозия маски на 9 пикселей от любых темных/синих краев окуляра
   final Uint8List safeMask = Uint8List(numPixels);
-  const int borderMargin = 9;
+  const int borderMargin = 11;
   for (int y = borderMargin; y < h - borderMargin; y++) {
     for (int x = borderMargin; x < w - borderMargin; x++) {
       final int p = y * w + x;
@@ -300,16 +338,34 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
           validMask[p + borderMargin] == 1 &&
           validMask[p - borderMargin * w] == 1 &&
           validMask[p + borderMargin * w] == 1 &&
-          validMask[p - 6 * w - 6] == 1 &&
-          validMask[p - 6 * w + 6] == 1 &&
-          validMask[p + 6 * w - 6] == 1 &&
-          validMask[p + 6 * w + 6] == 1) {
+          validMask[p - 8 * w - 8] == 1 &&
+          validMask[p - 8 * w + 8] == 1 &&
+          validMask[p + 8 * w - 8] == 1 &&
+          validMask[p + 8 * w + 8] == 1) {
         safeMask[p] = 1;
       }
     }
   }
 
-  // 2. Сглаживание 3x3 для подавления пиксельного шума JPEG
+  // Блокируем зоны, где пользователь вручную удалил ложные срабатывания (палочки / шум)
+  final double aspect = h.toDouble() / w.toDouble();
+  for (final bz in bannedZonesNorm) {
+    final int bx = (bz.dx * w.toDouble()).round();
+    final int by = (bz.dy * h.toDouble()).round();
+    const int banRad = 12;
+    for (int dy = -banRad; dy <= banRad; dy++) {
+      final int yy = by + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (int dx = -banRad; dx <= banRad; dx++) {
+        final int xx = bx + dx;
+        if (xx < 0 || xx >= w) continue;
+        if (dx * dx + dy * dy <= banRad * banRad) {
+          safeMask[yy * w + xx] = 0;
+        }
+      }
+    }
+  }
+
   final Float32List smooth = Float32List(numPixels);
   for (int y = 1; y < h - 1; y++) {
     for (int x = 1; x < w - 1; x++) {
@@ -328,76 +384,67 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
     }
   }
 
-  // 3. Вычитаем локальный фон (окно радиусом 12 пикс = 25x25):
-  // Белый фон дает 0.0, а стенки прозрачных капсул дают четкий положительный отклик!
-  final Float32List localBg = _computeLocalBackground(smooth, w, h, 12);
+  // Вычитание локального фона (окно 37x37)
+  final Float32List localBg = _computeLocalBackground(smooth, w, h, 18);
   final Float32List darkSignal = Float32List(numPixels);
-  final Float32List gxArr = Float32List(numPixels);
-  final Float32List gyArr = Float32List(numPixels);
-  final Float32List magArr = Float32List(numPixels);
 
-  // Мягкое влияние настроек Яркости и Четкости для мульти-расчета (без зашкаливания шума)
   final double paramBoost = (1.0 + (sharpness - 1.0) * 0.08 - brightness * 0.03)
       .clamp(0.75, 1.45);
-
-  for (int p = 0; p < numPixels; p++) {
-    final double diff = (localBg[p] - smooth[p]) * paramBoost;
-    darkSignal[p] = diff > 0.0 ? diff : 0.0;
-  }
 
   double sumSignal = 0.0;
   double sumSignalSq = 0.0;
   int validCount = 0;
 
-  for (int y = 2; y < h - 2; y++) {
-    for (int x = 2; x < w - 2; x++) {
-      final int p = y * w + x;
-      if (safeMask[p] == 0) continue;
+  for (int p = 0; p < numPixels; p++) {
+    if (safeMask[p] == 0) continue;
+    final double diff = (localBg[p] - smooth[p]) * paramBoost;
+    final double sig = diff > 0.0 ? diff : 0.0;
+    darkSignal[p] = sig;
 
-      final double gx =
-          -smooth[p - w - 1] +
-          smooth[p - w + 1] -
-          2.0 * smooth[p - 1] +
-          2.0 * smooth[p + 1] -
-          smooth[p + w - 1] +
-          smooth[p + w + 1];
-
-      final double gy =
-          -smooth[p - w - 1] -
-          2.0 * smooth[p - w] -
-          smooth[p - w + 1] +
-          smooth[p + w - 1] +
-          2.0 * smooth[p + w] +
-          smooth[p + w + 1];
-
-      final double mag = math.sqrt(gx * gx + gy * gy) * paramBoost;
-      gxArr[p] = gx;
-      gyArr[p] = gy;
-      magArr[p] = mag;
-
-      final double sig = darkSignal[p];
+    if (sig < 18.0) {
       sumSignal += sig;
       sumSignalSq += sig * sig;
       validCount++;
     }
   }
 
-  if (validCount < 200) return [];
+  if (validCount < 300) return [];
 
   final double meanSig = sumSignal / validCount.toDouble();
   final double stdSig = math.sqrt(
     math.max(0.0, (sumSignalSq / validCount.toDouble()) - meanSig * meanSig),
   );
 
-  // Жесткий порог отделения стенок капсул от шума JPEG (минимум 3.4 единицы контраста)
-  final double signalThreshold = math.max(
-    3.4 - sensitivity * 1.1,
-    meanSig + stdSig * (2.6 - sensitivity * 1.1),
+  double wallThreshold = math.max(
+    1.80 - sensitivity * 0.55,
+    meanSig + stdSig * (1.85 - sensitivity * 0.75),
   );
-  final double gradThreshold = math.max(10.0, 16.0 - sensitivity * 6.0);
 
-  final int clampedMinR = minR.clamp(3, 18);
-  final int clampedMaxR = maxR.clamp(clampedMinR + 1, 24);
+  int effMinR = minR.clamp(4, 26);
+  int effMaxR = maxR.clamp(effMinR + 1, 34);
+  double debrisThreshold = math.max(14.0, wallThreshold * 4.0);
+
+  if (learnedProfile != null) {
+    // При обучении НЕ занижаем порог до шума, а используем точный коридор эталона
+    wallThreshold = math.max(
+      1.65,
+      learnedProfile.targetWallSignal * (0.78 - (sensitivity - 0.5) * 0.20),
+    );
+    debrisThreshold = math.min(debrisThreshold, learnedProfile.maxAllowedSpike);
+    effMinR = learnedProfile.minRadiusPx.clamp(4, 28);
+    effMaxR = learnedProfile.maxRadiusPx.clamp(effMinR + 1, 36);
+  }
+
+  // Маркируем пиксели темных палочек / волокон (связные темные структуры)
+  final Uint8List rodPixelMask = Uint8List(numPixels);
+  for (int y = 2; y < h - 2; y++) {
+    for (int x = 2; x < w - 2; x++) {
+      final int p = y * w + x;
+      if (darkSignal[p] > debrisThreshold * 0.72) {
+        rodPixelMask[p] = 1;
+      }
+    }
+  }
 
   const int numAngles = 12;
   final List<double> cosTable = List.generate(
@@ -410,116 +457,210 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
   );
 
   final List<DetectedCapsule> rawCandidates = [];
+  final List<double> peakSig = List<double>.filled(numAngles, 0.0);
+  final List<int> peakRad = List<int>.filled(numAngles, 0);
+  final List<double> extSig = List<double>.filled(numAngles, 0.0);
 
-  // 4. Поиск кольцевых микрокапсул: проверяем наличие темной/преломляющей стенки на радиусе r
-  // и обязательное осветление снаружи на радиусе r + 3
-  for (int cyCurr = clampedMaxR + 6; cyCurr < h - clampedMaxR - 6; cyCurr++) {
-    for (int cxCurr = clampedMaxR + 6; cxCurr < w - clampedMaxR - 6; cxCurr++) {
+  // Поиск капсул с индивидуальным радиальным профилем вдоль каждого из 12 лучей
+  for (int cyCurr = effMaxR + 8; cyCurr < h - effMaxR - 8; cyCurr++) {
+    for (int cxCurr = effMaxR + 8; cxCurr < w - effMaxR - 8; cxCurr++) {
       final int centerIdx = cyCurr * w + cxCurr;
-      if (safeMask[centerIdx] == 0) continue;
+      if (safeMask[centerIdx] == 0 || rodPixelMask[centerIdx] == 1) continue;
 
-      // Быстрый фильтр: рядом с центром или на расстоянии 3 пикс должен быть заметный сигнал капсулы
-      if (darkSignal[centerIdx] < signalThreshold * 0.5 &&
-          darkSignal[centerIdx - 3] < signalThreshold * 0.7 &&
-          darkSignal[centerIdx + 3] < signalThreshold * 0.7 &&
-          darkSignal[centerIdx - 3 * w] < signalThreshold * 0.7 &&
-          darkSignal[centerIdx + 3 * w] < signalThreshold * 0.7) {
-        continue;
-      }
+      // Центр капсулы должен быть светлым (полым внутри), а не темной точкой или палочкой
+      final double innerHollowSig =
+          (darkSignal[centerIdx] * 2.0 +
+              darkSignal[centerIdx - 1] +
+              darkSignal[centerIdx + 1] +
+              darkSignal[centerIdx - w] +
+              darkSignal[centerIdx + w]) /
+          6.0;
+
+      if (innerHollowSig > wallThreshold * 1.15) continue;
 
       double bestRScore = -1.0;
-      int bestR = clampedMinR;
+      double bestRNorm = effMinR.toDouble() / w.toDouble();
 
-      for (int r = clampedMinR; r <= clampedMaxR; r++) {
+      for (int r = effMinR; r <= effMaxR; r++) {
         final double rD = r.toDouble();
-        final double rOuter = rD + 3.0;
+        // Эластичный пояс [0.78*r .. 1.25*r] позволяет точно ловить овальные капсулы
+        final int rStart = math.max(3, (rD * 0.78).round());
+        final int rEnd = math.min(effMaxR + 3, (rD * 1.25).round());
 
-        int ringActive = 0;
-        int gradActive = 0;
-        double ringSigSum = 0.0;
-        double outerSigSum = 0.0;
-        double gradSum = 0.0;
+        bool touchesRodOrDebris = false;
+        int rodTailRays = 0;
 
         for (int a = 0; a < numAngles; a++) {
           final double ca = cosTable[a];
           final double sa = sinTable[a];
 
-          final int px = (cxCurr.toDouble() + rD * ca).round();
-          final int py = (cyCurr.toDouble() + rD * sa).round();
-          final int pIdx = py * w + px;
+          double maxRaySig = -1.0;
+          int bestRayR = r;
 
-          final double sig = darkSignal[pIdx];
-          final double mag = magArr[pIdx];
-          ringSigSum += sig;
-          gradSum += mag;
+          for (int rr = rStart; rr <= rEnd; rr++) {
+            final int px = (cxCurr.toDouble() + rr.toDouble() * ca).round();
+            final int py = (cyCurr.toDouble() + rr.toDouble() * sa).round();
+            final int pIdx = py * w + px;
 
-          if (sig >= signalThreshold * 0.80) {
-            ringActive++;
+            if (rodPixelMask[pIdx] == 1) {
+              touchesRodOrDebris = true;
+              break;
+            }
+
+            final double s = darkSignal[pIdx];
+            if (s > maxRaySig) {
+              maxRaySig = s;
+              bestRayR = rr;
+            }
           }
-          if (mag >= gradThreshold) {
-            gradActive++;
+
+          if (touchesRodOrDebris || maxRaySig > debrisThreshold) {
+            touchesRodOrDebris = true;
+            break;
           }
 
-          // Точка снаружи капсулы (на радиусе r + 3)
-          final int ox = (cxCurr.toDouble() + rOuter * ca).round();
-          final int oy = (cyCurr.toDouble() + rOuter * sa).round();
-          outerSigSum += darkSignal[oy * w + ox];
+          peakSig[a] = maxRaySig;
+          peakRad[a] = bestRayR;
+
+          // Проверяем сигнал снаружи вдоль ЭТОГО ЖЕ луча (на расстоянии peakR + 3 и peakR + 5)
+          final double rOut1 = bestRayR.toDouble() + 3.0;
+          final double rOut2 = bestRayR.toDouble() + 5.0;
+          final int ox1 = (cxCurr.toDouble() + rOut1 * ca).round().clamp(
+            0,
+            w - 1,
+          );
+          final int oy1 = (cyCurr.toDouble() + rOut1 * sa).round().clamp(
+            0,
+            h - 1,
+          );
+          final int ox2 = (cxCurr.toDouble() + rOut2 * ca).round().clamp(
+            0,
+            w - 1,
+          );
+          final int oy2 = (cyCurr.toDouble() + rOut2 * sa).round().clamp(
+            0,
+            h - 1,
+          );
+
+          final int outIdx1 = oy1 * w + ox1;
+          final int outIdx2 = oy2 * w + ox2;
+
+          // Если снаружи торчит палочка (rodPixelMask), сразу отбраковываем!
+          if (rodPixelMask[outIdx1] == 1 || rodPixelMask[outIdx2] == 1) {
+            touchesRodOrDebris = true;
+            break;
+          }
+
+          final double outVal = math.max(
+            darkSignal[outIdx1],
+            darkSignal[outIdx2] * 0.9,
+          );
+          extSig[a] = outVal;
+
+          // Если снаружи вдоль луча темнее, чем на самом кольце — это хвост палочки/ворсинки!
+          if (outVal > maxRaySig * 1.15 && outVal > wallThreshold * 1.1) {
+            rodTailRays++;
+          }
         }
 
-        // Требуем, чтобы стенка капсулы прослеживалась минимум в 7 из 12 секторов окружности
-        final int minRingSectors = (8.5 - sensitivity * 2.5).round().clamp(
-          6,
-          9,
+        // Палочка или мусор рядом с кружком — мгновенный отказ!
+        if (touchesRodOrDebris || rodTailRays >= 2) continue;
+
+        // Проверяем плавность контура: радиус соседних лучей не должен скакать хаотично
+        int radiusJumps = 0;
+        for (int a = 0; a < numAngles; a++) {
+          final int nextA = (a + 1) % numAngles;
+          if ((peakRad[a] - peakRad[nextA]).abs() > 2) {
+            radiusJumps++;
+          }
+        }
+        if (radiusJumps > 3) continue;
+
+        // Анти-спайк фильтр: проверяем отношение максимума кольца к медиане
+        final List<double> sortedRing = List<double>.from(peakSig)..sort();
+        final double medianRing = (sortedRing[5] + sortedRing[6]) * 0.5;
+        final double maxRing = sortedRing[11];
+        final double minQuarterRing = sortedRing[3];
+
+        if (medianRing < wallThreshold * 0.85) continue;
+        // Если одна сторона кольца намного темнее остальных (прилипание к палочке сбоку) — отказ!
+        if (maxRing > medianRing * 2.25 || maxRing > minQuarterRing * 2.85) {
+          continue;
+        }
+
+        int validHollowRays = 0;
+        int validExteriorDropRays = 0;
+        double sumWallContrast = 0.0;
+        double sumExteriorDrop = 0.0;
+        double sumEffectiveR = 0.0;
+
+        for (int a = 0; a < numAngles; a++) {
+          final double wSig = peakSig[a];
+          final double hDiff = wSig - innerHollowSig;
+          final double eDiff = wSig - extSig[a];
+          sumEffectiveR += peakRad[a].toDouble();
+
+          if (wSig >= wallThreshold * 0.80 && hDiff >= wallThreshold * 0.42) {
+            validHollowRays++;
+            sumWallContrast += hDiff;
+          }
+          if (eDiff >= wallThreshold * 0.35) {
+            validExteriorDropRays++;
+            sumExteriorDrop += eDiff;
+          }
+        }
+
+        // Требуем замкнутую стенку вокруг полого центра минимум в 9 из 12 лучей
+        // и спад яркости наружу минимум в 8 из 12 лучей (допускает касание соседней капсулы в «восьмерке»)
+        if (validHollowRays < 9 || validExteriorDropRays < 8) continue;
+
+        // Проверка всех 4 квадрантов (верх, право, низ, лево)
+        final double qTop = (peakSig[0] + peakSig[1] + peakSig[11]) / 3.0;
+        final double qRight = (peakSig[2] + peakSig[3] + peakSig[4]) / 3.0;
+        final double qBottom = (peakSig[5] + peakSig[6] + peakSig[7]) / 3.0;
+        final double qLeft = (peakSig[8] + peakSig[9] + peakSig[10]) / 3.0;
+
+        final double minQ = math.min(
+          math.min(qTop, qBottom),
+          math.min(qLeft, qRight),
         );
-        if (ringActive < minRingSectors || gradActive < 5) continue;
+        final double maxQ = math.max(
+          math.max(qTop, qBottom),
+          math.max(qLeft, qRight),
+        );
 
-        final double meanRingSig = ringSigSum / numAngles.toDouble();
-        final double meanOuterSig = outerSigSum / numAngles.toDouble();
-        final double centerSig = darkSignal[centerIdx];
+        if (minQ < wallThreshold * 0.72) continue;
+        if (maxQ > minQ * 2.15) continue;
+        if (minQ - innerHollowSig < wallThreshold * 0.38) continue;
 
-        // Капсула должна быть заметно темнее/контрастнее окружающего её внешнего фона
-        if (meanRingSig < signalThreshold) continue;
-        if (meanOuterSig > meanRingSig * 0.72) continue;
-
-        // У микрокапсул в проходящем свете центр обычно светлее преломляющей стенки
-        final double hollowBonus = centerSig < meanRingSig * 0.85
-            ? (meanRingSig - centerSig) * 1.5
-            : 0.0;
-
-        // Проверка симметрии противоположных сторон (отсекает длинные ворсинки и нити)
-        int symmetricPairs = 0;
-        for (int a = 0; a < 6; a++) {
-          final int p1 =
-              (cyCurr.toDouble() + rD * sinTable[a]).round() * w +
-              (cxCurr.toDouble() + rD * cosTable[a]).round();
-          final int p2 =
-              (cyCurr.toDouble() + rD * sinTable[a + 6]).round() * w +
-              (cxCurr.toDouble() + rD * cosTable[a + 6]).round();
-          if (darkSignal[p1] >= signalThreshold * 0.70 &&
-              darkSignal[p2] >= signalThreshold * 0.70) {
-            symmetricPairs++;
-          }
+        double profileWeight = 1.0;
+        if (learnedProfile != null) {
+          final double diffWall =
+              (medianRing - learnedProfile.targetWallSignal).abs() /
+              math.max(1.0, learnedProfile.targetWallSignal);
+          if (diffWall > 0.85) continue;
+          profileWeight = (1.45 - diffWall * 0.75).clamp(0.75, 1.45);
         }
-        if (symmetricPairs < 3) continue;
 
         final double score =
-            (meanRingSig - meanOuterSig) * 4.0 +
-            hollowBonus +
-            (gradSum / numAngles.toDouble()) * 0.35 +
-            symmetricPairs.toDouble() * 3.0;
+            ((sumWallContrast / numAngles.toDouble()) * 5.0 +
+                (sumExteriorDrop / numAngles.toDouble()) * 4.2 +
+                minQ * 3.0 +
+                validHollowRays.toDouble() * 1.8) *
+            profileWeight;
 
         if (score > bestRScore) {
           bestRScore = score;
-          bestR = r;
+          bestRNorm = (sumEffectiveR / numAngles.toDouble()) / w.toDouble();
         }
       }
 
-      if (bestRScore > 16.0) {
+      if (bestRScore > 15.5) {
         rawCandidates.add(
           DetectedCapsule(
             cxNorm: cxCurr.toDouble() / w.toDouble(),
             cyNorm: cyCurr.toDouble() / h.toDouble(),
-            rNorm: bestR.toDouble() / w.toDouble(),
+            rNorm: bestRNorm,
             score: bestRScore,
           ),
         );
@@ -527,10 +668,8 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
     }
   }
 
-  // 5. Подавление немаксимумов (NMS): оставляем только один самый четкий центр на каждую капсулу
   rawCandidates.sort((a, b) => b.score.compareTo(a.score));
   final List<DetectedCapsule> accepted = [];
-  final double aspect = h.toDouble() / w.toDouble();
 
   for (final cand in rawCandidates) {
     bool overlaps = false;
@@ -538,7 +677,7 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
       final double dx = cand.cxNorm - ex.cxNorm;
       final double dy = (cand.cyNorm - ex.cyNorm) * aspect;
       final double dist = math.sqrt(dx * dx + dy * dy);
-      final double minAllowedDist = (cand.rNorm + ex.rNorm) * 0.78;
+      final double minAllowedDist = (cand.rNorm + ex.rNorm) * 0.74;
       if (dist < minAllowedDist) {
         overlaps = true;
         break;
@@ -546,7 +685,7 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
     }
     if (!overlaps) {
       accepted.add(cand);
-      if (accepted.length >= 180) break;
+      if (accepted.length >= 200) break;
     }
   }
 
@@ -589,11 +728,11 @@ class _CameraScreenState extends State<CameraScreen> {
   int _loadedImageWidth = 1080;
   int _loadedImageHeight = 1920;
 
+  static const int _workResolutionWidth = 640;
   Uint8List? _cachedWorkRgba;
   int _cachedWorkW = 0;
   int _cachedWorkH = 0;
-  Float32List? _snapLum;
-  Float32List? _snapMag;
+  Float32List? _snapDarkSignal;
   bool _snapBufferDirty = true;
 
   double _brightness = 0.0;
@@ -605,7 +744,8 @@ class _CameraScreenState extends State<CameraScreen> {
   double _minExposure = -2.0;
   double _maxExposure = 2.0;
   double _minZoom = 1.0;
-  double _maxZoom = 5.0;
+  // Увеличенное максимальное масштабирование до 20.0x
+  double _maxZoom = 20.0;
   double _currentZoom = 1.0;
   Offset _photoPanOffset = Offset.zero;
 
@@ -630,34 +770,64 @@ class _CameraScreenState extends State<CameraScreen> {
   List<String> _magnificationList = ['4x', '10x', '20x', '40x', '100x'];
 
   List<DetectedCapsule> _capsules = [];
+  // Координаты удаленных пользователем ложных точек (палочек/шума) для обучения
+  final List<Offset> _bannedNoiseZonesNorm = [];
   double? _multiPassAverageCount;
   List<SinglePassSummary> _lastMultiPassDetails = [];
   bool _showCapsuleOverlay = true;
   bool _manualEditCapsules = false;
   bool _magneticSnapEnabled = true;
+
+  // Индекс выбранного кружка в режиме правки и его регулируемый радиус
+  int? _selectedCapsuleIndex;
   int? _draggingCapsuleIndex;
+  double _manualBrushRNorm = 0.010; // Регулируется боковым ползунком
+
+  LearnedCapsuleProfile? _learnedProfile;
 
   String _multiBrightnessInput = '-0.5 0.0 0.5';
   String _multiSharpnessInput = '1.0 1.5 2.0';
-  int _minCapsuleRadiusPx = 3;
-  int _maxCapsuleRadiusPx = 10;
+  int _minCapsuleRadiusPx = 4;
+  int _maxCapsuleRadiusPx = 14;
   double _detectionSensitivity = 0.55;
 
   @override
   void initState() {
     super.initState();
-    _loadCustomMagnifications();
+    _loadSavedSettings();
     if (widget.camera != null) {
       _initCamera();
     }
   }
 
-  Future<void> _loadCustomMagnifications() async {
+  Future<void> _loadSavedSettings() async {
     final prefs = await SharedPreferences.getInstance();
     final savedList = prefs.getStringList('custom_magnifications');
     if (savedList != null && savedList.isNotEmpty) {
       setState(() {
         _magnificationList = savedList;
+      });
+    }
+
+    final double? wallSig = prefs.getDouble('learned_wall_sig');
+    final double? hollowDiff = prefs.getDouble('learned_hollow_diff');
+    final double? maxSpike = prefs.getDouble('learned_max_spike');
+    final int? minR = prefs.getInt('learned_min_r');
+    final int? maxR = prefs.getInt('learned_max_r');
+    final int? trainCnt = prefs.getInt('learned_train_count');
+
+    if (wallSig != null && hollowDiff != null && minR != null && maxR != null) {
+      setState(() {
+        _learnedProfile = LearnedCapsuleProfile(
+          targetWallSignal: wallSig,
+          targetHollowDiff: hollowDiff,
+          maxAllowedSpike: maxSpike ?? 14.0,
+          minRadiusPx: minR,
+          maxRadiusPx: maxR,
+          trainingCount: trainCnt ?? 1,
+        );
+        _minCapsuleRadiusPx = minR;
+        _maxCapsuleRadiusPx = maxR;
       });
     }
   }
@@ -699,7 +869,8 @@ class _CameraScreenState extends State<CameraScreen> {
         _minExposure = await ctrl.getMinExposureOffset();
         _maxExposure = await ctrl.getMaxExposureOffset();
         _minZoom = await ctrl.getMinZoomLevel();
-        _maxZoom = math.min(await ctrl.getMaxZoomLevel(), 8.0);
+        // Разрешаем до 20x масштабирования
+        _maxZoom = 20.0;
       } catch (_) {}
 
       if (mounted) {
@@ -897,100 +1068,96 @@ class _CameraScreenState extends State<CameraScreen> {
     });
     if (_loadedImageBytes == null && _controller != null) {
       try {
-        await _controller!.setZoomLevel(clamped);
+        final double hwMax = await _controller!.getMaxZoomLevel();
+        await _controller!.setZoomLevel(clamped.clamp(_minZoom, hwMax));
       } catch (_) {}
     }
   }
 
-  // ==========================================================================
-  // МАГНИТНОЕ ПРИКЛЕИВАНИЕ ТОЧКИ К БЛИЖАЙШЕЙ КАПСУЛЕ НА СНИМКЕ
-  // ==========================================================================
+  // Изменение диаметра (радиуса) активного кружка с помощью бокового ползунка
+  void _updateManualCircleRadiusNorm(double newRNorm) {
+    final double clampedR = newRNorm.clamp(0.003, 0.055);
+    setState(() {
+      _manualBrushRNorm = clampedR;
+      if (_selectedCapsuleIndex != null &&
+          _selectedCapsuleIndex! >= 0 &&
+          _selectedCapsuleIndex! < _capsules.length) {
+        final int idx = _selectedCapsuleIndex!;
+        _capsules[idx] = _capsules[idx].copyWith(
+          rNorm: clampedR,
+          isManual: true,
+        );
+      }
+    });
+  }
+
   void _ensureSnapBufferReady() {
-    if (!_snapBufferDirty && _snapLum != null && _snapMag != null) return;
+    if (!_snapBufferDirty && _snapDarkSignal != null) return;
     final Uint8List? rgba = _cachedWorkRgba;
     final int w = _cachedWorkW;
     final int h = _cachedWorkH;
     if (rgba == null || w <= 0 || h <= 0) return;
 
     final int numPixels = w * h;
-    final Float32List lum = Float32List(numPixels);
-    final Float32List mag = Float32List(numPixels);
+    final Float32List rawLum = Float32List(numPixels);
 
     for (int i = 0; i < numPixels; i++) {
       final int idx = i * 4;
       final double r = rgba[idx].toDouble();
       final double g = rgba[idx + 1].toDouble();
       final double b = rgba[idx + 2].toDouble();
-      lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+      rawLum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
     }
 
-    for (int y = 2; y < h - 2; y++) {
-      for (int x = 2; x < w - 2; x++) {
-        final int p = y * w + x;
-        final double gx =
-            -lum[p - w - 1] +
-            lum[p - w + 1] -
-            2.0 * lum[p - 1] +
-            2.0 * lum[p + 1] -
-            lum[p + w - 1] +
-            lum[p + w + 1];
-
-        final double gy =
-            -lum[p - w - 1] -
-            2.0 * lum[p - w] -
-            lum[p - w + 1] +
-            lum[p + w - 1] +
-            2.0 * lum[p + w] +
-            lum[p + w + 1];
-
-        mag[p] = math.sqrt(gx * gx + gy * gy);
-      }
+    final Float32List localBg = _computeLocalBackground(rawLum, w, h, 18);
+    final Float32List darkSig = Float32List(numPixels);
+    for (int i = 0; i < numPixels; i++) {
+      final double d = localBg[i] - rawLum[i];
+      darkSig[i] = d > 0.0 ? d : 0.0;
     }
 
-    _snapLum = lum;
-    _snapMag = mag;
+    _snapDarkSignal = darkSig;
     _snapBufferDirty = false;
   }
 
+  // Магнитное притягивание центра точки к капсуле с сохранением возможности менять диаметр ползунком
   DetectedCapsule _createCapsuleWithMagneticSnap(
     double tapXNorm,
     double tapYNorm, {
     int? ignoreIndex,
+    double? preserveRNorm,
   }) {
-    double fallbackRNorm = 0.011;
-    if (_capsules.isNotEmpty) {
-      fallbackRNorm =
-          _capsules.map((e) => e.rNorm).reduce((a, b) => a + b) /
-          _capsules.length.toDouble();
-    }
+    final double targetRNorm = preserveRNorm ?? _manualBrushRNorm;
 
     if (!_magneticSnapEnabled || _cachedWorkRgba == null) {
       return DetectedCapsule(
         cxNorm: tapXNorm,
         cyNorm: tapYNorm,
-        rNorm: fallbackRNorm,
+        rNorm: targetRNorm,
+        isManual: true,
       );
     }
 
     _ensureSnapBufferReady();
-    final Float32List? mag = _snapMag;
-    final Float32List? lum = _snapLum;
+    final Float32List? darkSig = _snapDarkSignal;
     final int w = _cachedWorkW;
     final int h = _cachedWorkH;
-    if (mag == null || lum == null || w <= 0 || h <= 0) {
+    if (darkSig == null || w <= 0 || h <= 0) {
       return DetectedCapsule(
         cxNorm: tapXNorm,
         cyNorm: tapYNorm,
-        rNorm: fallbackRNorm,
+        rNorm: targetRNorm,
+        isManual: true,
       );
     }
 
-    final int tapX = (tapXNorm * w.toDouble()).round().clamp(8, w - 9);
-    final int tapY = (tapYNorm * h.toDouble()).round().clamp(8, h - 9);
+    final int tapX = (tapXNorm * w.toDouble()).round().clamp(10, w - 11);
+    final int tapY = (tapYNorm * h.toDouble()).round().clamp(10, h - 11);
 
-    const int snapSearchRadius = 11;
-    final int minR = _minCapsuleRadiusPx.clamp(3, 16);
-    final int maxR = _maxCapsuleRadiusPx.clamp(minR + 1, 20);
+    const int snapSearchRadius = 12;
+    final int baseR = (targetRNorm * w.toDouble()).round().clamp(3, 30);
+    final int minR = (baseR - 3).clamp(3, 28);
+    final int maxR = (baseR + 3).clamp(minR + 1, 32);
 
     const int numAngles = 12;
     final List<double> cosT = List.generate(
@@ -1005,20 +1172,20 @@ class _CameraScreenState extends State<CameraScreen> {
     double bestScore = -1.0;
     int bestCx = tapX;
     int bestCy = tapY;
-    int bestR = (fallbackRNorm * w.toDouble()).round().clamp(minR, maxR);
+    int bestR = baseR;
 
     final double aspect = h.toDouble() / w.toDouble();
 
     for (int dy = -snapSearchRadius; dy <= snapSearchRadius; dy++) {
       final int cy = tapY + dy;
-      if (cy <= maxR || cy >= h - maxR) continue;
+      if (cy <= maxR + 2 || cy >= h - maxR - 2) continue;
 
       for (int dx = -snapSearchRadius; dx <= snapSearchRadius; dx++) {
         final int distSq = dx * dx + dy * dy;
         if (distSq > snapSearchRadius * snapSearchRadius) continue;
 
         final int cx = tapX + dx;
-        if (cx <= maxR || cx >= w - maxR) continue;
+        if (cx <= maxR + 2 || cx >= w - maxR - 2) continue;
 
         final double candXNorm = cx.toDouble() / w.toDouble();
         final double candYNorm = cy.toDouble() / h.toDouble();
@@ -1029,7 +1196,7 @@ class _CameraScreenState extends State<CameraScreen> {
           final ex = _capsules[i];
           final double ddx = candXNorm - ex.cxNorm;
           final double ddy = (candYNorm - ex.cyNorm) * aspect;
-          if (math.sqrt(ddx * ddx + ddy * ddy) < ex.rNorm * 0.80) {
+          if (math.sqrt(ddx * ddx + ddy * ddy) < ex.rNorm * 0.72) {
             tooCloseToExisting = true;
             break;
           }
@@ -1039,34 +1206,32 @@ class _CameraScreenState extends State<CameraScreen> {
         final double proximityWeight =
             1.0 -
             0.35 * (math.sqrt(distSq.toDouble()) / snapSearchRadius.toDouble());
-        final double centerLum = lum[cy * w + cx];
+        final double centerSig = darkSig[cy * w + cx];
 
         for (int r = minR; r <= maxR; r++) {
           final double rD = r.toDouble();
-          double ringMagSum = 0.0;
-          double ringLumSum = 0.0;
+          double ringSum = 0.0;
           int activeAngles = 0;
 
           for (int a = 0; a < numAngles; a++) {
-            final int px = (cx.toDouble() + rD * cosT[a]).round();
-            final int py = (cy.toDouble() + rD * sinT[a]).round();
-            final int pIdx = py * w + px;
-            final double g = mag[pIdx];
-            ringMagSum += g;
-            ringLumSum += lum[pIdx];
-            if (g > 8.0) activeAngles++;
+            final double ca = cosT[a];
+            final double sa = sinT[a];
+            final int p1 =
+                (cy.toDouble() + rD * sa).round() * w +
+                (cx.toDouble() + rD * ca).round();
+            final double sig = darkSig[p1];
+            ringSum += sig;
+            if (sig > centerSig + 0.8) activeAngles++;
           }
 
-          if (activeAngles < 5) continue;
+          if (activeAngles < 7) continue;
 
-          final double meanRingMag = ringMagSum / numAngles.toDouble();
-          final double meanRingLum = ringLumSum / numAngles.toDouble();
-          final double rimContrast = (centerLum - meanRingLum).abs();
+          final double meanRing = ringSum / numAngles.toDouble();
+          final double hollowContrast = meanRing - centerSig;
+          if (hollowContrast <= 0.6) continue;
 
           final double candidateScore =
-              (meanRingMag * 1.4 +
-                  rimContrast * 1.1 +
-                  activeAngles.toDouble() * 2.2) *
+              (hollowContrast * 3.5 + activeAngles.toDouble() * 2.0) *
               proximityWeight;
 
           if (candidateScore > bestScore) {
@@ -1079,20 +1244,200 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    if (bestScore > 16.0) {
+    if (bestScore > 12.0) {
+      final double snappedRNorm =
+          preserveRNorm ?? (bestR.toDouble() / w.toDouble());
+      _manualBrushRNorm = snappedRNorm;
       return DetectedCapsule(
         cxNorm: bestCx.toDouble() / w.toDouble(),
         cyNorm: bestCy.toDouble() / h.toDouble(),
-        rNorm: bestR.toDouble() / w.toDouble(),
+        rNorm: snappedRNorm,
         score: bestScore,
+        isManual: true,
       );
     }
 
     return DetectedCapsule(
       cxNorm: tapXNorm,
       cyNorm: tapYNorm,
-      rNorm: fallbackRNorm,
+      rNorm: targetRNorm,
+      isManual: true,
     );
+  }
+
+  // ==========================================================================
+  // УСИЛЕННОЕ ОБУЧЕНИЕ ПО ОБРАЗЦУ (УЧИТЫВАЕТ КАПСУЛЫ + ЗАПОМИНАЕТ УДАЛЕННЫЙ ШУМ)
+  // ==========================================================================
+  Future<void> _trainFromMarkedCapsules() async {
+    if (_capsules.isEmpty || _cachedWorkRgba == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Сначала отметьте пальцем хотя бы 1–3 реальные капсулы на снимке!',
+          ),
+        ),
+      );
+      return;
+    }
+
+    _ensureSnapBufferReady();
+    final Float32List? darkSig = _snapDarkSignal;
+    final int w = _cachedWorkW;
+    final int h = _cachedWorkH;
+    if (darkSig == null || w <= 0 || h <= 0) return;
+
+    const int numAngles = 12;
+    final List<double> cosT = List.generate(
+      numAngles,
+      (i) => math.cos(i.toDouble() * 2.0 * math.pi / numAngles.toDouble()),
+    );
+    final List<double> sinT = List.generate(
+      numAngles,
+      (i) => math.sin(i.toDouble() * 2.0 * math.pi / numAngles.toDouble()),
+    );
+
+    double sumWallSig = 0.0;
+    double sumHollowDiff = 0.0;
+    double maxObservedCapsulePeak = 0.0;
+    int minR = 999;
+    int maxR = 0;
+    int sampleCount = 0;
+
+    // 1. Извлекаем истинный пиковый сигнал стенок отмеченных капсул (в поясе [0.75r .. 1.25r])
+    for (final c in _capsules) {
+      final int cx = (c.cxNorm * w.toDouble()).round().clamp(10, w - 11);
+      final int cy = (c.cyNorm * h.toDouble()).round().clamp(10, h - 11);
+      final int r = (c.rNorm * w.toDouble()).round().clamp(3, 30);
+
+      final double centerSig = darkSig[cy * w + cx];
+      final int rStart = math.max(3, (r.toDouble() * 0.75).round());
+      final int rEnd = math.min(34, (r.toDouble() * 1.25).round());
+
+      double ringPeakSum = 0.0;
+      for (int a = 0; a < numAngles; a++) {
+        final double ca = cosT[a];
+        final double sa = sinT[a];
+        double rayMax = 0.0;
+        for (int rr = rStart; rr <= rEnd; rr++) {
+          final int px = (cx.toDouble() + rr.toDouble() * ca).round().clamp(
+            0,
+            w - 1,
+          );
+          final int py = (cy.toDouble() + rr.toDouble() * sa).round().clamp(
+            0,
+            h - 1,
+          );
+          final double s = darkSig[py * w + px];
+          if (s > rayMax) rayMax = s;
+        }
+        ringPeakSum += rayMax;
+        if (rayMax > maxObservedCapsulePeak) {
+          maxObservedCapsulePeak = rayMax;
+        }
+      }
+
+      final double meanRingPeak = ringPeakSum / numAngles.toDouble();
+      sumWallSig += meanRingPeak;
+      sumHollowDiff += math.max(0.8, meanRingPeak - centerSig);
+      if (r < minR) minR = r;
+      if (r > maxR) maxR = r;
+      sampleCount++;
+    }
+
+    if (sampleCount == 0) return;
+
+    double learnedWall = (sumWallSig / sampleCount.toDouble()).clamp(1.8, 14.0);
+    double learnedHollow = (sumHollowDiff / sampleCount.toDouble()).clamp(
+      0.8,
+      12.0,
+    );
+    double learnedMaxSpike = math
+        .max(9.0, maxObservedCapsulePeak * 1.55)
+        .clamp(9.0, 22.0);
+
+    // 2. Анализируем удаленные пользователем ложные точки (палочки / черные точки),
+    // чтобы жестко ограничить максимальный порог черного шума
+    if (_bannedNoiseZonesNorm.isNotEmpty) {
+      double minBannedSpike = 999.0;
+      for (final bz in _bannedNoiseZonesNorm) {
+        final int bx = (bz.dx * w.toDouble()).round().clamp(6, w - 7);
+        final int by = (bz.dy * h.toDouble()).round().clamp(6, h - 7);
+        double localMax = 0.0;
+        for (int dy = -6; dy <= 6; dy++) {
+          for (int dx = -6; dx <= 6; dx++) {
+            final double s = darkSig[(by + dy) * w + (bx + dx)];
+            if (s > localMax) localMax = s;
+          }
+        }
+        if (localMax > learnedWall * 1.4 && localMax < minBannedSpike) {
+          minBannedSpike = localMax;
+        }
+      }
+      if (minBannedSpike < 900.0) {
+        learnedMaxSpike = math.min(learnedMaxSpike, minBannedSpike * 0.90);
+      }
+    }
+
+    final int learnedMinR = (minR - 1).clamp(3, 26);
+    final int learnedMaxR = (maxR + 2).clamp(learnedMinR + 1, 34);
+    final int nextTrainCount = (_learnedProfile?.trainingCount ?? 0) + 1;
+
+    // Плавное накопление опыта между нажатиями «Обучить»
+    if (_learnedProfile != null) {
+      learnedWall =
+          (_learnedProfile!.targetWallSignal * 0.35) + (learnedWall * 0.65);
+      learnedHollow =
+          (_learnedProfile!.targetHollowDiff * 0.35) + (learnedHollow * 0.65);
+      learnedMaxSpike = math.min(
+        _learnedProfile!.maxAllowedSpike,
+        learnedMaxSpike,
+      );
+    }
+
+    final profile = LearnedCapsuleProfile(
+      targetWallSignal: learnedWall,
+      targetHollowDiff: learnedHollow,
+      maxAllowedSpike: learnedMaxSpike,
+      minRadiusPx: learnedMinR,
+      maxRadiusPx: learnedMaxR,
+      trainingCount: nextTrainCount,
+    );
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('learned_wall_sig', profile.targetWallSignal);
+    await prefs.setDouble('learned_hollow_diff', profile.targetHollowDiff);
+    await prefs.setDouble('learned_max_spike', profile.maxAllowedSpike);
+    await prefs.setInt('learned_min_r', profile.minRadiusPx);
+    await prefs.setInt('learned_max_r', profile.maxRadiusPx);
+    await prefs.setInt('learned_train_count', profile.trainingCount);
+
+    // Сохраняем все текущие проверенные пользователем капсулы, чтобы они не сбросились!
+    final List<DetectedCapsule> userVerifiedCapsules = _capsules
+        .map((c) => c.copyWith(isManual: true))
+        .toList();
+
+    setState(() {
+      _learnedProfile = profile;
+      _minCapsuleRadiusPx = learnedMinR;
+      _maxCapsuleRadiusPx = learnedMaxR;
+    });
+
+    await _runCapsuleDetection(
+      brightnessValues: [_brightness],
+      sharpnessValues: [_sharpness],
+      preservedManualCapsules: userVerifiedCapsules,
+    );
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.deepPurple.shade700,
+          content: Text(
+            'Обучение #$nextTrainCount применено! Учтено образцов: $sampleCount, заблокировано шумов: ${_bannedNoiseZonesNorm.length}.',
+          ),
+        ),
+      );
+    }
   }
 
   Future<void> _autoFitGridToOcular(Uint8List bytes) async {
@@ -1172,11 +1517,11 @@ class _CameraScreenState extends State<CameraScreen> {
     final ui.Codec fullCodec = await ui.instantiateImageCodec(bytes);
     final ui.FrameInfo fullFrame = await fullCodec.getNextFrame();
 
-    const int workWidth = 480;
+    final int workWidth = _workResolutionWidth;
     final int workHeight =
         ((workWidth * fullFrame.image.height) / fullFrame.image.width)
             .round()
-            .clamp(240, 840);
+            .clamp(320, 1180);
 
     final ui.Codec workCodec = await ui.instantiateImageCodec(
       bytes,
@@ -1199,6 +1544,8 @@ class _CameraScreenState extends State<CameraScreen> {
       _cachedWorkH = workFrame.image.height;
       _snapBufferDirty = true;
       _capsules = [];
+      _bannedNoiseZonesNorm.clear();
+      _selectedCapsuleIndex = null;
       _multiPassAverageCount = null;
       _lastMultiPassDetails = [];
       _currentZoom = 1.0;
@@ -1214,9 +1561,10 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() {
       _loadedImageBytes = null;
       _cachedWorkRgba = null;
-      _snapLum = null;
-      _snapMag = null;
+      _snapDarkSignal = null;
       _capsules = [];
+      _bannedNoiseZonesNorm.clear();
+      _selectedCapsuleIndex = null;
       _multiPassAverageCount = null;
       _lastMultiPassDetails = [];
       _manualEditCapsules = false;
@@ -1241,6 +1589,7 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _runCapsuleDetection({
     required List<double> brightnessValues,
     required List<double> sharpnessValues,
+    List<DetectedCapsule>? preservedManualCapsules,
   }) async {
     FocusManager.instance.primaryFocus?.unfocus();
     if (_isProcessing) return;
@@ -1266,13 +1615,44 @@ class _CameraScreenState extends State<CameraScreen> {
         roiCenterXNorm: _gridCenterXNorm,
         roiCenterYNorm: _gridCenterYNorm,
         roiRadiusNorm: _gridRadiusNorm,
+        learnedProfile: _learnedProfile,
+        bannedZonesNorm: List<Offset>.from(_bannedNoiseZonesNorm),
       );
 
       final MultiPassResult result = await compute(_runMultiPassIsolate, task);
 
       if (!mounted) return;
+
+      final List<DetectedCapsule> mergedCapsules = [];
+      if (preservedManualCapsules != null &&
+          preservedManualCapsules.isNotEmpty) {
+        mergedCapsules.addAll(preservedManualCapsules);
+      }
+
+      final double aspect =
+          _cachedWorkH.toDouble() / math.max(1.0, _cachedWorkW.toDouble());
+
+      for (final autoCap in result.bestCapsules) {
+        bool overlapsWithManual = false;
+        for (final manCap in mergedCapsules) {
+          final double dx = autoCap.cxNorm - manCap.cxNorm;
+          final double dy = (autoCap.cyNorm - manCap.cyNorm) * aspect;
+          if (math.sqrt(dx * dx + dy * dy) <
+              (autoCap.rNorm + manCap.rNorm) * 0.78) {
+            overlapsWithManual = true;
+            break;
+          }
+        }
+        if (!overlapsWithManual) {
+          mergedCapsules.add(autoCap);
+        }
+      }
+
       setState(() {
-        _capsules = List<DetectedCapsule>.from(result.bestCapsules);
+        _capsules = mergedCapsules;
+        _selectedCapsuleIndex = _capsules.isNotEmpty
+            ? _capsules.length - 1
+            : null;
         _multiPassAverageCount = result.averageCount;
         _lastMultiPassDetails = result.passes;
         _showCapsuleOverlay = true;
@@ -1284,18 +1664,20 @@ class _CameraScreenState extends State<CameraScreen> {
       final stats = _getDiameterStatsMicrons();
       final bool isMulti = result.passes.length > 1;
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          duration: const Duration(seconds: 3),
-          backgroundColor: Colors.teal.shade800,
-          content: Text(
-            isMulti
-                ? 'Мульти-расчет (${result.passes.length} проходов): Среднее = ${result.averageCount.toStringAsFixed(1)} шт. '
-                      '(выбрано: ${_capsules.length} шт.) | Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм'
-                : 'Найдено капсул: ${_capsules.length} шт. | Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм',
+      if (preservedManualCapsules == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.teal.shade800,
+            content: Text(
+              isMulti
+                  ? 'Мульти-расчет (${result.passes.length} проходов): Среднее = ${result.averageCount.toStringAsFixed(1)} шт. '
+                        '(выбрано: ${_capsules.length} шт.) | Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм'
+                  : 'Найдено капсул: ${_capsules.length} шт. | Ср. диаметр: ${stats['mean']!.toStringAsFixed(1)} мкм',
+            ),
           ),
-        ),
-      );
+        );
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -1380,7 +1762,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   ),
                   const Divider(),
                   Text(
-                    'Радиус капсул на матрице: $tempMinR – $tempMaxR пикс.',
+                    'Радиус капсул (при 640px): $tempMinR – $tempMaxR пикс.',
                     style: const TextStyle(fontSize: 12),
                   ),
                   RangeSlider(
@@ -1389,8 +1771,8 @@ class _CameraScreenState extends State<CameraScreen> {
                       tempMaxR.toDouble(),
                     ),
                     min: 3,
-                    max: 24,
-                    divisions: 21,
+                    max: 32,
+                    divisions: 29,
                     activeColor: Colors.cyanAccent,
                     labels: RangeLabels('$tempMinR px', '$tempMaxR px'),
                     onChanged: (vals) {
@@ -1411,6 +1793,46 @@ class _CameraScreenState extends State<CameraScreen> {
                     activeColor: Colors.amberAccent,
                     onChanged: (val) => setDialogState(() => tempSens = val),
                   ),
+                  if (_learnedProfile != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.psychology,
+                            size: 16,
+                            color: Colors.purpleAccent,
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              'Обучений: ${_learnedProfile!.trainingCount} (R: ${_learnedProfile!.minRadiusPx}–${_learnedProfile!.maxRadiusPx}px)',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.purpleAccent,
+                              ),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () async {
+                              final prefs =
+                                  await SharedPreferences.getInstance();
+                              await prefs.remove('learned_wall_sig');
+                              await prefs.remove('learned_train_count');
+                              setState(() {
+                                _learnedProfile = null;
+                                _bannedNoiseZonesNorm.clear();
+                              });
+                              setDialogState(() {});
+                            },
+                            child: const Text(
+                              'Сбросить',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   if (_lastMultiPassDetails.isNotEmpty) ...[
                     const Divider(),
                     Text(
@@ -1662,6 +2084,8 @@ class _CameraScreenState extends State<CameraScreen> {
       if (hitIdx >= 0) {
         setState(() {
           _draggingCapsuleIndex = hitIdx;
+          _selectedCapsuleIndex = hitIdx;
+          _manualBrushRNorm = _capsules[hitIdx].rNorm;
         });
       }
     }
@@ -1714,9 +2138,11 @@ class _CameraScreenState extends State<CameraScreen> {
           normPos.dx,
           normPos.dy,
           ignoreIndex: idx,
+          preserveRNorm: _capsules[idx].rNorm,
         );
         setState(() {
           _capsules[idx] = snapped;
+          _selectedCapsuleIndex = idx;
         });
       }
       return;
@@ -1769,13 +2195,32 @@ class _CameraScreenState extends State<CameraScreen> {
       setState(() {
         _draggingCapsuleIndex = null;
         if (hitIndex >= 0) {
-          _capsules.removeAt(hitIndex);
+          // Запоминаем удаленную точку как отрицательный пример (шум/палочка)
+          final removed = _capsules.removeAt(hitIndex);
+          _bannedNoiseZonesNorm.add(Offset(removed.cxNorm, removed.cyNorm));
+          if (_selectedCapsuleIndex == hitIndex) {
+            _selectedCapsuleIndex = _capsules.isNotEmpty
+                ? _capsules.length - 1
+                : null;
+          } else if (_selectedCapsuleIndex != null &&
+              _selectedCapsuleIndex! > hitIndex) {
+            _selectedCapsuleIndex = _selectedCapsuleIndex! - 1;
+          }
         } else {
+          // Если пользователь ставит точку туда, где раньше удалял, снимаем бан с этой точки
+          _bannedNoiseZonesNorm.removeWhere(
+            (bz) =>
+                (bz.dx - tapXNorm).abs() < 0.025 &&
+                (bz.dy - tapYNorm).abs() < 0.025,
+          );
+
           final DetectedCapsule newCap = _createCapsuleWithMagneticSnap(
             tapXNorm,
             tapYNorm,
           );
           _capsules.add(newCap);
+          _selectedCapsuleIndex = _capsules.length - 1;
+          _manualBrushRNorm = newCap.rNorm;
         }
       });
       return;
@@ -1823,6 +2268,10 @@ class _CameraScreenState extends State<CameraScreen> {
       if (_manualEditCapsules) {
         _adjustGridMode = false;
         _showCapsuleOverlay = true;
+        if (_capsules.isNotEmpty) {
+          _selectedCapsuleIndex ??= _capsules.length - 1;
+          _manualBrushRNorm = _capsules[_selectedCapsuleIndex!].rNorm;
+        }
       }
     });
   }
@@ -2192,6 +2641,8 @@ class _CameraScreenState extends State<CameraScreen> {
     final bool isPhotoMode = _loadedImageBytes != null;
     final diameterStats = _getDiameterStatsMicrons();
     final double scaleUm = _getScaleMicrons();
+    final double currentBrushDiamUm =
+        2.0 * _manualBrushRNorm * (scaleUm / 0.20);
 
     return Scaffold(
       resizeToAvoidBottomInset: true,
@@ -2312,7 +2763,7 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
 
-            // 2. ПАНЕЛЬ СТАТИСТИКИ, МАГНИТНОЙ ПРАВКИ ТОЧЕК И ПОДГОНА СЕТКИ
+            // 2. ПАНЕЛЬ СТАТИСТИКИ, МАГНИТНОЙ ПРАВКИ И ОБУЧЕНИЯ
             Container(
               width: double.infinity,
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -2338,15 +2789,15 @@ class _CameraScreenState extends State<CameraScreen> {
                       _adjustGridMode
                           ? '1 палец — двигать сетку, 2 пальца — размер круга'
                           : (_manualEditCapsules
-                                ? 'Тап: +приклеить / -удалить (${_capsules.length} шт., Ø ${diameterStats['mean']!.toStringAsFixed(0)} мкм)'
+                                ? 'Тап: +/– | Справа: Ø кружка (${_capsules.length} шт., Ø ${diameterStats['mean']!.toStringAsFixed(1)} мкм)'
                                 : (_capsules.isEmpty
                                       ? (isPhotoMode
                                             ? 'Нажмите «Считать», «Мульти» или «Правка»'
-                                            : 'Зум 2 пальцами. Нажмите «Галерея» или «Считать»')
+                                            : 'Зум до 20x. Нажмите «Галерея» или «Считать»')
                                       : 'Капсул: ${_capsules.length} шт.${_multiPassAverageCount != null ? " (Ср: ${_multiPassAverageCount!.toStringAsFixed(1)})" : ""} | '
                                             'Ø: ${diameterStats['mean']!.toStringAsFixed(1)} мкм')),
                       style: TextStyle(
-                        fontSize: 10.8,
+                        fontSize: 10.5,
                         fontWeight: FontWeight.w600,
                         color: _adjustGridMode
                             ? Colors.cyanAccent
@@ -2368,7 +2819,7 @@ class _CameraScreenState extends State<CameraScreen> {
                     }),
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
+                        horizontal: 5,
                         vertical: 3,
                       ),
                       decoration: BoxDecoration(
@@ -2380,7 +2831,7 @@ class _CameraScreenState extends State<CameraScreen> {
                       child: Text(
                         _adjustGridMode ? 'Сетка: ОК' : 'Сетка',
                         style: TextStyle(
-                          fontSize: 10,
+                          fontSize: 9.8,
                           fontWeight: FontWeight.bold,
                           color: _adjustGridMode
                               ? Colors.black
@@ -2389,12 +2840,12 @@ class _CameraScreenState extends State<CameraScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 5),
+                  const SizedBox(width: 4),
                   InkWell(
                     onTap: _toggleManualEditMode,
                     child: Container(
                       padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
+                        horizontal: 5,
                         vertical: 3,
                       ),
                       decoration: BoxDecoration(
@@ -2406,7 +2857,7 @@ class _CameraScreenState extends State<CameraScreen> {
                       child: Text(
                         _manualEditCapsules ? 'Правка: ВКЛ' : 'Правка',
                         style: TextStyle(
-                          fontSize: 10,
+                          fontSize: 9.8,
                           fontWeight: FontWeight.bold,
                           color: _manualEditCapsules
                               ? Colors.black
@@ -2449,10 +2900,38 @@ class _CameraScreenState extends State<CameraScreen> {
                         ),
                       ),
                     ),
+                    const SizedBox(width: 4),
+                    InkWell(
+                      onTap: _isProcessing ? null : _trainFromMarkedCapsules,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 5,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.purpleAccent.withOpacity(0.28),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: Colors.purpleAccent),
+                        ),
+                        child: Text(
+                          _learnedProfile != null
+                              ? 'Обучить (${_learnedProfile!.trainingCount})'
+                              : 'Обучить',
+                          style: const TextStyle(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.purpleAccent,
+                          ),
+                        ),
+                      ),
+                    ),
                     if (_capsules.isNotEmpty) ...[
                       const SizedBox(width: 4),
                       InkWell(
-                        onTap: () => setState(() => _capsules.clear()),
+                        onTap: () => setState(() {
+                          _capsules.clear();
+                          _selectedCapsuleIndex = null;
+                        }),
                         child: const Icon(
                           Icons.delete_sweep,
                           size: 17,
@@ -2480,7 +2959,7 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
 
-            // 3. ОБЛАСТЬ ИЗОБРАЖЕНИЯ
+            // 3. ОБЛАСТЬ ИЗОБРАЖЕНИЯ + БОКОВОЙ ПОЛЗУНОК ДИАМЕТРА КРУЖКА В РЕЖИМЕ ПРАВКИ
             Expanded(
               child: Center(
                 child: LayoutBuilder(
@@ -2498,162 +2977,300 @@ class _CameraScreenState extends State<CameraScreen> {
                       width: viewWidth,
                       height: viewHeight,
                       child: ClipRect(
-                        child: GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTapUp: (details) =>
-                              _onTapViewport(details, viewSize),
-                          onScaleStart: (details) =>
-                              _onScaleStart(details, viewSize),
-                          onScaleUpdate: (details) =>
-                              _onScaleUpdate(details, viewSize),
-                          onScaleEnd: _onScaleEnd,
-                          child: Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              if (isPhotoMode)
-                                Transform.translate(
-                                  offset: _photoPanOffset,
-                                  child: Transform.scale(
-                                    scale: _currentZoom,
-                                    child: SizedBox(
-                                      width: viewWidth,
-                                      height: viewHeight,
-                                      child: Stack(
-                                        fit: StackFit.expand,
-                                        children: [
-                                          ColorFiltered(
-                                            colorFilter: _buildColorFilter(),
-                                            child: Image.memory(
-                                              _loadedImageBytes!,
-                                              fit: BoxFit.fill,
-                                              gaplessPlayback: true,
-                                            ),
-                                          ),
-                                          if (_showCapsuleOverlay &&
-                                              _capsules.isNotEmpty)
-                                            IgnorePointer(
-                                              child: CustomPaint(
-                                                size: viewSize,
-                                                painter: CapsuleOverlayPainter(
-                                                  capsules: _capsules,
-                                                  scaleMicrons: scaleUm,
-                                                  zoomLevel: _currentZoom,
-                                                  activeIndex:
-                                                      _draggingCapsuleIndex,
-                                                  isEditMode:
-                                                      _manualEditCapsules,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTapUp: (details) =>
+                                  _onTapViewport(details, viewSize),
+                              onScaleStart: (details) =>
+                                  _onScaleStart(details, viewSize),
+                              onScaleUpdate: (details) =>
+                                  _onScaleUpdate(details, viewSize),
+                              onScaleEnd: _onScaleEnd,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  if (isPhotoMode)
+                                    Transform.translate(
+                                      offset: _photoPanOffset,
+                                      child: Transform.scale(
+                                        scale: _currentZoom,
+                                        child: SizedBox(
+                                          width: viewWidth,
+                                          height: viewHeight,
+                                          child: Stack(
+                                            fit: StackFit.expand,
+                                            children: [
+                                              ColorFiltered(
+                                                colorFilter:
+                                                    _buildColorFilter(),
+                                                child: Image.memory(
+                                                  _loadedImageBytes!,
+                                                  fit: BoxFit.fill,
+                                                  gaplessPlayback: true,
                                                 ),
                                               ),
-                                            ),
-                                          if (_showGrid)
-                                            IgnorePointer(
-                                              child: CustomPaint(
-                                                size: viewSize,
-                                                painter: MicroscopeGridPainter(
-                                                  centerXNorm: _gridCenterXNorm,
-                                                  centerYNorm: _gridCenterYNorm,
-                                                  radiusNorm: _gridRadiusNorm,
-                                                  isAdjusting: _adjustGridMode,
-                                                  zoomLevel: _currentZoom,
+                                              if (_showCapsuleOverlay &&
+                                                  _capsules.isNotEmpty)
+                                                IgnorePointer(
+                                                  child: CustomPaint(
+                                                    size: viewSize,
+                                                    painter: CapsuleOverlayPainter(
+                                                      capsules: _capsules,
+                                                      scaleMicrons: scaleUm,
+                                                      zoomLevel: _currentZoom,
+                                                      activeIndex:
+                                                          _selectedCapsuleIndex ??
+                                                          _draggingCapsuleIndex,
+                                                      isEditMode:
+                                                          _manualEditCapsules,
+                                                    ),
+                                                  ),
                                                 ),
+                                              if (_showGrid)
+                                                IgnorePointer(
+                                                  child: CustomPaint(
+                                                    size: viewSize,
+                                                    painter:
+                                                        MicroscopeGridPainter(
+                                                          centerXNorm:
+                                                              _gridCenterXNorm,
+                                                          centerYNorm:
+                                                              _gridCenterYNorm,
+                                                          radiusNorm:
+                                                              _gridRadiusNorm,
+                                                          isAdjusting:
+                                                              _adjustGridMode,
+                                                          zoomLevel:
+                                                              _currentZoom,
+                                                        ),
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    )
+                                  else if (_isCameraInitialized &&
+                                      _controller != null)
+                                    Stack(
+                                      fit: StackFit.expand,
+                                      children: [
+                                        FittedBox(
+                                          fit: BoxFit.cover,
+                                          child: SizedBox(
+                                            width: viewWidth,
+                                            height:
+                                                viewWidth *
+                                                _controller!.value.aspectRatio,
+                                            child: ColorFiltered(
+                                              colorFilter: _buildColorFilter(),
+                                              child: CameraPreview(
+                                                _controller!,
                                               ),
                                             ),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                )
-                              else if (_isCameraInitialized &&
-                                  _controller != null)
-                                Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    FittedBox(
-                                      fit: BoxFit.cover,
-                                      child: SizedBox(
-                                        width: viewWidth,
-                                        height:
-                                            viewWidth *
-                                            _controller!.value.aspectRatio,
-                                        child: ColorFiltered(
-                                          colorFilter: _buildColorFilter(),
-                                          child: CameraPreview(_controller!),
+                                          ),
                                         ),
-                                      ),
+                                        if (_showCapsuleOverlay &&
+                                            _capsules.isNotEmpty)
+                                          IgnorePointer(
+                                            child: CustomPaint(
+                                              size: viewSize,
+                                              painter: CapsuleOverlayPainter(
+                                                capsules: _capsules,
+                                                scaleMicrons: scaleUm,
+                                                zoomLevel: _currentZoom,
+                                                activeIndex:
+                                                    _selectedCapsuleIndex ??
+                                                    _draggingCapsuleIndex,
+                                                isEditMode: _manualEditCapsules,
+                                              ),
+                                            ),
+                                          ),
+                                        if (_showGrid)
+                                          IgnorePointer(
+                                            child: CustomPaint(
+                                              size: viewSize,
+                                              painter: MicroscopeGridPainter(
+                                                centerXNorm: _gridCenterXNorm,
+                                                centerYNorm: _gridCenterYNorm,
+                                                radiusNorm: _gridRadiusNorm,
+                                                isAdjusting: _adjustGridMode,
+                                                zoomLevel: 1.0,
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    )
+                                  else
+                                    Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        const CircularProgressIndicator(),
+                                        const SizedBox(height: 12),
+                                        ElevatedButton.icon(
+                                          onPressed: _pickImageFromGallery,
+                                          icon: const Icon(Icons.photo_library),
+                                          label: const Text(
+                                            'Открыть фото из галереи',
+                                          ),
+                                        ),
+                                      ],
                                     ),
-                                    if (_showCapsuleOverlay &&
-                                        _capsules.isNotEmpty)
-                                      IgnorePointer(
-                                        child: CustomPaint(
-                                          size: viewSize,
-                                          painter: CapsuleOverlayPainter(
-                                            capsules: _capsules,
-                                            scaleMicrons: scaleUm,
-                                            zoomLevel: _currentZoom,
-                                            activeIndex: _draggingCapsuleIndex,
-                                            isEditMode: _manualEditCapsules,
+
+                                  if (_focusPoint != null)
+                                    Positioned(
+                                      left: _focusPoint!.dx - 25,
+                                      top: _focusPoint!.dy - 25,
+                                      child: Container(
+                                        width: 50,
+                                        height: 50,
+                                        decoration: BoxDecoration(
+                                          border: Border.all(
+                                            color: Colors.greenAccent,
+                                            width: 2,
+                                          ),
+                                          borderRadius: BorderRadius.circular(
+                                            4,
                                           ),
                                         ),
                                       ),
-                                    if (_showGrid)
-                                      IgnorePointer(
-                                        child: CustomPaint(
-                                          size: viewSize,
-                                          painter: MicroscopeGridPainter(
-                                            centerXNorm: _gridCenterXNorm,
-                                            centerYNorm: _gridCenterYNorm,
-                                            radiusNorm: _gridRadiusNorm,
-                                            isAdjusting: _adjustGridMode,
-                                            zoomLevel: 1.0,
+                                    ),
+
+                                  if (_countdown > 0)
+                                    Text(
+                                      '$_countdown',
+                                      style: const TextStyle(
+                                        fontSize: 90,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.orangeAccent,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+
+                            // БОКОВОЙ ПОЛЗУНОК ДИАМЕТРА КРУЖКА КАПСУЛЫ В РЕЖИМЕ «ПРАВКА»
+                            if (_manualEditCapsules)
+                              Positioned(
+                                right: 8,
+                                top: 20,
+                                bottom: 20,
+                                child: Container(
+                                  width: 46,
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 8,
+                                    horizontal: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color.fromRGBO(
+                                      18,
+                                      18,
+                                      18,
+                                      0.86,
+                                    ),
+                                    borderRadius: BorderRadius.circular(24),
+                                    border: Border.all(
+                                      color: Colors.cyanAccent.withOpacity(0.6),
+                                      width: 1.2,
+                                    ),
+                                  ),
+                                  child: Column(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      const Text(
+                                        'Ø круга',
+                                        textAlign: TextAlign.center,
+                                        style: TextStyle(
+                                          fontSize: 8.5,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.cyanAccent,
+                                        ),
+                                      ),
+                                      Text(
+                                        '${currentBrushDiamUm.toStringAsFixed(1)}\nмкм',
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(
+                                          fontSize: 9.0,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.amberAccent,
+                                        ),
+                                      ),
+                                      InkWell(
+                                        onTap: () =>
+                                            _updateManualCircleRadiusNorm(
+                                              _manualBrushRNorm + 0.0012,
+                                            ),
+                                        child: Container(
+                                          padding: const EdgeInsets.all(4),
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            color: Colors.white12,
+                                          ),
+                                          child: const Icon(
+                                            Icons.add_circle_outline,
+                                            size: 18,
+                                            color: Colors.cyanAccent,
                                           ),
                                         ),
                                       ),
-                                  ],
-                                )
-                              else
-                                Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    const CircularProgressIndicator(),
-                                    const SizedBox(height: 12),
-                                    ElevatedButton.icon(
-                                      onPressed: _pickImageFromGallery,
-                                      icon: const Icon(Icons.photo_library),
-                                      label: const Text(
-                                        'Открыть фото из галереи',
+                                      Expanded(
+                                        child: RotatedBox(
+                                          quarterTurns: 3,
+                                          child: SliderTheme(
+                                            data: SliderTheme.of(context).copyWith(
+                                              trackHeight: 3.0,
+                                              thumbShape:
+                                                  const RoundSliderThumbShape(
+                                                    enabledThumbRadius: 7.0,
+                                                  ),
+                                              overlayShape:
+                                                  const RoundSliderOverlayShape(
+                                                    overlayRadius: 12.0,
+                                                  ),
+                                            ),
+                                            child: Slider(
+                                              value: _manualBrushRNorm.clamp(
+                                                0.003,
+                                                0.055,
+                                              ),
+                                              min: 0.003,
+                                              max: 0.055,
+                                              activeColor: Colors.cyanAccent,
+                                              inactiveColor: Colors.white24,
+                                              onChanged:
+                                                  _updateManualCircleRadiusNorm,
+                                            ),
+                                          ),
+                                        ),
                                       ),
-                                    ),
-                                  ],
-                                ),
-
-                              if (_focusPoint != null)
-                                Positioned(
-                                  left: _focusPoint!.dx - 25,
-                                  top: _focusPoint!.dy - 25,
-                                  child: Container(
-                                    width: 50,
-                                    height: 50,
-                                    decoration: BoxDecoration(
-                                      border: Border.all(
-                                        color: Colors.greenAccent,
-                                        width: 2,
+                                      InkWell(
+                                        onTap: () =>
+                                            _updateManualCircleRadiusNorm(
+                                              _manualBrushRNorm - 0.0012,
+                                            ),
+                                        child: Container(
+                                          padding: const EdgeInsets.all(4),
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            color: Colors.white12,
+                                          ),
+                                          child: const Icon(
+                                            Icons.remove_circle_outline,
+                                            size: 18,
+                                            color: Colors.cyanAccent,
+                                          ),
+                                        ),
                                       ),
-                                      borderRadius: BorderRadius.circular(4),
-                                    ),
+                                    ],
                                   ),
                                 ),
-
-                              if (_countdown > 0)
-                                Text(
-                                  '$_countdown',
-                                  style: const TextStyle(
-                                    fontSize: 90,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.orangeAccent,
-                                  ),
-                                ),
-                            ],
-                          ),
+                              ),
+                          ],
                         ),
                       ),
                     );
@@ -2897,14 +3514,16 @@ class _CameraScreenState extends State<CameraScreen> {
                           setState(() {
                             _selectedFilter = LabFilter.standard;
                             _capsules = [];
+                            _bannedNoiseZonesNorm.clear();
+                            _selectedCapsuleIndex = null;
                             _multiPassAverageCount = null;
                             _gridCenterXNorm = 0.5;
                             _gridCenterYNorm = 0.5;
                             _gridRadiusNorm = 0.36;
                             _adjustGridMode = false;
                             _manualEditCapsules = false;
-                            _minCapsuleRadiusPx = 3;
-                            _maxCapsuleRadiusPx = 10;
+                            _minCapsuleRadiusPx = 4;
+                            _maxCapsuleRadiusPx = 14;
                             _detectionSensitivity = 0.55;
                             _snapBufferDirty = true;
                           });
@@ -2927,9 +3546,6 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
-// ============================================================================
-// ОТРИСОВЩИК КОНТУРОВ И ПОДПИСЕЙ КАПСУЛ (НЕЛИНЕЙНО УМЕНЬШАЕТ ТЕКСТ ПРИ ЗУМЕ)
-// ============================================================================
 class CapsuleOverlayPainter extends CustomPainter {
   final List<DetectedCapsule> capsules;
   final double scaleMicrons;
@@ -2947,30 +3563,28 @@ class CapsuleOverlayPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final double z = zoomLevel.clamp(1.0, 8.0);
-    // Поскольку сам холст находится внутри Transform.scale(scale: z),
-    // деление на z^1.75 заставляет текст реально уменьшаться на экране при приближении!
-    final double textShrinkFactor = math.pow(z, 1.75).toDouble();
-    final double strokeShrinkFactor = math.pow(z, 1.35).toDouble();
+    final double z = zoomLevel.clamp(1.0, 25.0);
+    final double textShrinkFactor = math.pow(z, 1.55).toDouble();
+    final double strokeShrinkFactor = math.pow(z, 1.25).toDouble();
 
     final Paint circlePaint = Paint()
       ..color = Colors.greenAccent
       ..style = PaintingStyle.stroke
-      ..strokeWidth = (1.3 / strokeShrinkFactor).clamp(0.22, 1.5);
+      ..strokeWidth = (1.3 / strokeShrinkFactor).clamp(0.12, 1.5);
 
     final Paint activeCirclePaint = Paint()
       ..color = Colors.cyanAccent
       ..style = PaintingStyle.stroke
-      ..strokeWidth = (2.0 / strokeShrinkFactor).clamp(0.35, 2.2);
+      ..strokeWidth = (2.0 / strokeShrinkFactor).clamp(0.20, 2.2);
 
     final Paint centerPaint = Paint()
       ..color = Colors.amberAccent
       ..style = PaintingStyle.fill;
 
     final double dotRadius = ((isEditMode ? 2.0 : 1.4) / strokeShrinkFactor)
-        .clamp(0.28, 2.2);
-    final double dynamicFontSize = (6.8 / textShrinkFactor).clamp(1.0, 7.0);
-    final double labelOffset = (1.4 / textShrinkFactor).clamp(0.2, 2.0);
+        .clamp(0.15, 2.2);
+    final double dynamicFontSize = (6.8 / textShrinkFactor).clamp(0.55, 7.0);
+    final double labelOffset = (1.4 / textShrinkFactor).clamp(0.1, 2.0);
 
     for (int i = 0; i < capsules.length; i++) {
       final c = capsules[i];
@@ -3185,7 +3799,7 @@ class MicroscopeGridPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final double z = zoomLevel.clamp(1.0, 8.0);
+    final double z = zoomLevel.clamp(1.0, 25.0);
     final Paint paint = Paint()
       ..color = isAdjusting
           ? const Color.fromRGBO(255, 215, 64, 0.85)
