@@ -85,17 +85,13 @@ class DetectedCapsule {
 }
 
 class LearnedCapsuleProfile {
-  final double targetWallSignal;
-  final double targetHollowDiff;
-  final double maxAllowedSpike;
+  final double targetContrast;
   final int minRadiusPx;
   final int maxRadiusPx;
   final int trainingCount;
 
   const LearnedCapsuleProfile({
-    required this.targetWallSignal,
-    required this.targetHollowDiff,
-    required this.maxAllowedSpike,
+    required this.targetContrast,
     required this.minRadiusPx,
     required this.maxRadiusPx,
     this.trainingCount = 1,
@@ -168,9 +164,6 @@ class MultiPassResult {
   });
 }
 
-// ============================================================================
-// КОНВЕРТАЦИЯ FLOAT16 <-> DOUBLE (ДЛЯ СОВМЕСТИМОСТИ С ЛЮБЫМ ЭКСПОРТОМ TFLITE)
-// ============================================================================
 int _doubleToFloat16Bits(double value) {
   final bd = ByteData(4)..setFloat32(0, value, Endian.little);
   final int fbits = bd.getUint32(0, Endian.little);
@@ -215,14 +208,15 @@ double _float16BitsToDouble(int hbits) {
 }
 
 // ============================================================================
-// АЛГОРИТМ ПОДСЧЕТА КАПСУЛ (ПО ПРИНЦИПУ CAPSULECOUNTER: DoG + МОРФОЛОГИЯ)
+// ПОЛНЫЙ АЛГОРИТМ CAPSULECOUNTER v1.6:
+// Адаптивная бинаризация + Морфологическая заливка полостей + Blob-фильтрация
 // ============================================================================
 MultiPassResult _runMultiPassIsolate(MultiPassTask task) {
   final List<SinglePassSummary> passes = [];
 
   for (final double b in task.brightnessList) {
     for (final double s in task.sharpnessList) {
-      final capsules = _detectCapsulesSinglePass(
+      final capsules = _detectCapsulesCapsuleCounterEngine(
         rgba: task.rgbaBytes,
         w: task.width,
         h: task.height,
@@ -326,136 +320,103 @@ Float32List _computeBoxBlur(Float32List src, int w, int h, int radius) {
   return out;
 }
 
-// Морфологический фильтр связных компонент: находит длинные волокна/палочки
-// по моментам инерции и вытянутости (Eccentricity / Major Axis) и блокирует их
-Uint8List _buildFiberAndDebrisMask(
-  Float32List darkSignal,
+// Морфологическое замыкание 3x3 (дилата + эрозия) для смыкания тонких стенок капсул
+Uint8List _morphClose3x3(Uint8List bin, Uint8List mask, int w, int h) {
+  final int n = w * h;
+  final Uint8List dilated = Uint8List(n);
+  final Uint8List closed = Uint8List(n);
+
+  for (int y = 1; y < h - 1; y++) {
+    final int row = y * w;
+    for (int x = 1; x < w - 1; x++) {
+      final int p = row + x;
+      if (mask[p] == 0) continue;
+      if (bin[p] == 1 ||
+          bin[p - 1] == 1 ||
+          bin[p + 1] == 1 ||
+          bin[p - w] == 1 ||
+          bin[p + w] == 1) {
+        dilated[p] = 1;
+      }
+    }
+  }
+
+  for (int y = 1; y < h - 1; y++) {
+    final int row = y * w;
+    for (int x = 1; x < w - 1; x++) {
+      final int p = row + x;
+      if (mask[p] == 0 || dilated[p] == 0) continue;
+      if (dilated[p - 1] == 1 &&
+          dilated[p + 1] == 1 &&
+          dilated[p - w] == 1 &&
+          dilated[p + w] == 1) {
+        closed[p] = 1;
+      }
+    }
+  }
+
+  return closed;
+}
+
+// Заливка внутренних полостей капсул (Flood Fill от внешнего фона):
+// превращает пустотелые колечки капсул в сплошные круглые/овальные объекты
+Uint8List _fillEnclosedCapsuleHoles(
+  Uint8List bin,
   Uint8List safeMask,
   int w,
   int h,
-  double fiberThresh,
-  int maxCapsuleRadius,
+  int maxHoleArea,
 ) {
-  final int numPixels = w * h;
-  final Uint8List visited = Uint8List(numPixels);
-  final Uint8List badMask = Uint8List(numPixels);
-  final Int32List queue = Int32List(numPixels);
+  final int n = w * h;
+  final Uint8List out = Uint8List.fromList(bin);
+  final Uint8List visitedBg = Uint8List(n);
+  final Int32List queue = Int32List(n);
 
-  for (int i = 0; i < numPixels; i++) {
-    if (safeMask[i] == 0 || visited[i] == 1) continue;
-    if (darkSignal[i] < fiberThresh) continue;
+  for (int i = 0; i < n; i++) {
+    if (safeMask[i] == 0 || out[i] == 1 || visitedBg[i] == 1) continue;
 
     int head = 0;
     int tail = 0;
     queue[tail++] = i;
-    visited[i] = 1;
-
-    int minX = i % w;
-    int maxX = minX;
-    int minY = i ~/ w;
-    int maxY = minY;
-    double sumX = 0.0;
-    double sumY = 0.0;
-    double sumWeight = 0.0;
+    visitedBg[i] = 1;
+    bool touchesOutside = false;
 
     while (head < tail) {
       final int curr = queue[head++];
       final int cx = curr % w;
       final int cy = curr ~/ w;
-      final double weight = darkSignal[curr];
 
-      if (cx < minX) minX = cx;
-      if (cx > maxX) maxX = cx;
-      if (cy < minY) minY = cy;
-      if (cy > maxY) maxY = cy;
+      if (cx <= 2 || cx >= w - 3 || cy <= 2 || cy >= h - 3) {
+        touchesOutside = true;
+      }
 
-      sumX += cx.toDouble() * weight;
-      sumY += cy.toDouble() * weight;
-      sumWeight += weight;
-
-      for (int dy = -1; dy <= 1; dy++) {
-        final int ny = cy + dy;
-        if (ny <= 1 || ny >= h - 1) continue;
-        for (int dx = -1; dx <= 1; dx++) {
-          final int nx = cx + dx;
-          if (nx <= 1 || nx >= w - 1) continue;
-          final int nIdx = ny * w + nx;
-          if (visited[nIdx] == 0 &&
-              safeMask[nIdx] == 1 &&
-              darkSignal[nIdx] >= fiberThresh * 0.75) {
-            visited[nIdx] = 1;
-            queue[tail++] = nIdx;
-          }
+      final List<int> neighbors = [curr - 1, curr + 1, curr - w, curr + w];
+      for (final nb in neighbors) {
+        if (nb < 0 || nb >= n) continue;
+        if (safeMask[nb] == 0) {
+          touchesOutside = true;
+          continue;
+        }
+        if (out[nb] == 0 && visitedBg[nb] == 0) {
+          visitedBg[nb] = 1;
+          queue[tail++] = nb;
         }
       }
     }
 
-    final int count = tail;
-    if (count < 4) continue;
-
-    final double meanX = sumX / sumWeight;
-    final double meanY = sumY / sumWeight;
-    double mu20 = 0.0;
-    double mu02 = 0.0;
-    double mu11 = 0.0;
-    double maxSigInComp = 0.0;
-
-    for (int k = 0; k < count; k++) {
-      final int idx = queue[k];
-      final double dx = (idx % w).toDouble() - meanX;
-      final double dy = (idx ~/ w).toDouble() - meanY;
-      final double wt = darkSignal[idx];
-      if (wt > maxSigInComp) maxSigInComp = wt;
-      mu20 += wt * dx * dx;
-      mu02 += wt * dy * dy;
-      mu11 += wt * dx * dy;
-    }
-
-    mu20 /= sumWeight;
-    mu02 /= sumWeight;
-    mu11 /= sumWeight;
-
-    final double diff = mu20 - mu02;
-    final double root = math.sqrt(diff * diff + 4.0 * mu11 * mu11);
-    final double lambda1 = math.max(0.1, (mu20 + mu02 + root) * 0.5);
-    final double lambda2 = math.max(0.1, (mu20 + mu02 - root) * 0.5);
-    final double elongation = math.sqrt(lambda1 / lambda2);
-
-    final int spanW = maxX - minX + 1;
-    final int spanH = maxY - minY + 1;
-    final double diag = math.sqrt((spanW * spanW + spanH * spanH).toDouble());
-
-    // Критерий ворсинки / палочки / черного пятна грязи:
-    // 1) Вытянутая темная структура (elongation > 2.35 и диагональ > 16px)
-    // 2) Слишком резкое черное пятно пыли (maxSigInComp > fiberThresh * 2.2 и малая площадь)
-    final bool isFiberStick =
-        (elongation > 2.35 && diag > 15.0) ||
-        (diag > maxCapsuleRadius.toDouble() * 3.2 && elongation > 1.95) ||
-        (maxSigInComp > fiberThresh * 2.4 && count < 45 && elongation > 1.5);
-
-    if (isFiberStick) {
-      const int halo = 5;
-      for (int k = 0; k < count; k++) {
-        final int idx = queue[k];
-        final int px = idx % w;
-        final int py = idx ~/ w;
-        for (int hy = -halo; hy <= halo; hy++) {
-          final int yy = py + hy;
-          if (yy < 0 || yy >= h) continue;
-          for (int hx = -halo; hx <= halo; hx++) {
-            final int xx = px + hx;
-            if (xx < 0 || xx >= w) continue;
-            badMask[yy * w + xx] = 1;
-          }
-        }
+    // Если белая область замкнута внутри темной оболочки и её площадь соответствует полости капсулы — заливаем!
+    if (!touchesOutside && tail <= maxHoleArea) {
+      for (int k = 0; k < tail; k++) {
+        out[queue[k]] = 1;
       }
     }
   }
 
-  return badMask;
+  return out;
 }
 
-List<DetectedCapsule> _detectCapsulesSinglePass({
+// Ядро подсчета капсул по алгоритму CapsuleCounter v1.6
+List<DetectedCapsule> _detectCapsulesCapsuleCounterEngine({
   required Uint8List rgba,
   required int w,
   required int h,
@@ -478,10 +439,10 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
   final double cx = roiCenterXNorm * w.toDouble();
   final double cy = roiCenterYNorm * h.toDouble();
   final double minSide = math.min(w, h).toDouble();
-  final double effectiveRadius = minSide * roiRadiusNorm * 0.90;
+  final double effectiveRadius = minSide * roiRadiusNorm * 0.89;
   final double maxSearchRadiusSq = effectiveRadius * effectiveRadius;
 
-  // 1. Выделение светлого круга окуляра (отсечение черной рамки и синей хроматической каймы)
+  // 1. Выделение светлого поля микроскопа (отсечение черной рамки и синего ореола окуляра)
   for (int y = 0; y < h; y++) {
     final double dy = y.toDouble() - cy;
     for (int x = 0; x < w; x++) {
@@ -497,16 +458,15 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
       rawLum[p] = lum;
 
       if (dx * dx + dy * dy <= maxSearchRadiusSq &&
-          lum > 140.0 &&
-          (b - r) < 25.0) {
+          lum > 145.0 &&
+          (b - r) < 22.0) {
         validMask[p] = 1;
       }
     }
   }
 
-  // Безопасный отступ от края линзы
   final Uint8List safeMask = Uint8List(numPixels);
-  const int borderMargin = 10;
+  const int borderMargin = 11;
   for (int y = borderMargin; y < h - borderMargin; y++) {
     for (int x = borderMargin; x < w - borderMargin; x++) {
       final int p = y * w + x;
@@ -515,16 +475,16 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
           validMask[p + borderMargin] == 1 &&
           validMask[p - borderMargin * w] == 1 &&
           validMask[p + borderMargin * w] == 1 &&
-          validMask[p - 7 * w - 7] == 1 &&
-          validMask[p - 7 * w + 7] == 1 &&
-          validMask[p + 7 * w - 7] == 1 &&
-          validMask[p + 7 * w + 7] == 1) {
+          validMask[p - 8 * w - 8] == 1 &&
+          validMask[p - 8 * w + 8] == 1 &&
+          validMask[p + 8 * w - 8] == 1 &&
+          validMask[p + 8 * w + 8] == 1) {
         safeMask[p] = 1;
       }
     }
   }
 
-  // Блокируем точки, которые пользователь удалил вручную в режиме правки
+  // Блокируем точки, удаленные пользователем вручную
   for (final bz in bannedZonesNorm) {
     final int bx = (bz.dx * w.toDouble()).round();
     final int by = (bz.dy * h.toDouble()).round();
@@ -542,263 +502,304 @@ List<DetectedCapsule> _detectCapsulesSinglePass({
     }
   }
 
-  // 2. Разность гауссианов (DoG): подавляет высокочастотный шум и неравномерную засветку лампы
-  final Float32List smoothSmall = _computeBoxBlur(rawLum, w, h, 1); // 3x3
-  final Float32List localBg = _computeBoxBlur(smoothSmall, w, h, 16); // 33x33
-
-  final Float32List darkSignal = Float32List(numPixels);
-  final Float32List gradMag = Float32List(numPixels);
+  // 2. Сглаживание шума и вычисление локального фона (Adaptive Thresholding)
+  final Float32List smooth = _computeBoxBlur(rawLum, w, h, 1); // 3x3
+  final Float32List localBg = _computeBoxBlur(smooth, w, h, 15); // 31x31
+  final Float32List diffMap = Float32List(numPixels);
 
   final double paramBoost = (1.0 + (sharpness - 1.0) * 0.10 - brightness * 0.04)
-      .clamp(0.75, 1.60);
+      .clamp(0.75, 1.55);
 
-  double sumSig = 0.0;
-  double sumSigSq = 0.0;
+  double sumDiff = 0.0;
+  double sumDiffSq = 0.0;
   int validCount = 0;
 
   for (int p = 0; p < numPixels; p++) {
     if (safeMask[p] == 0) continue;
-    final double diff = (localBg[p] - smoothSmall[p]) * paramBoost;
-    final double sig = diff > 0.0 ? diff : 0.0;
-    darkSignal[p] = sig;
+    final double d = (localBg[p] - smooth[p]) * paramBoost;
+    final double posD = d > 0.0 ? d : 0.0;
+    diffMap[p] = posD;
 
-    if (sig < 15.0) {
-      sumSig += sig;
-      sumSigSq += sig * sig;
+    if (posD < 16.0) {
+      sumDiff += posD;
+      sumDiffSq += posD * posD;
       validCount++;
     }
   }
 
-  if (validCount < 300) return [];
+  if (validCount < 400) return [];
 
-  for (int y = 2; y < h - 2; y++) {
-    for (int x = 2; x < w - 2; x++) {
-      final int p = y * w + x;
-      if (safeMask[p] == 0) continue;
-      final double gx = smoothSmall[p + 1] - smoothSmall[p - 1];
-      final double gy = smoothSmall[p + w] - smoothSmall[p - w];
-      gradMag[p] = math.sqrt(gx * gx + gy * gy) * paramBoost;
+  final double meanD = sumDiff / validCount.toDouble();
+  final double stdD = math.sqrt(
+    math.max(0.0, (sumDiffSq / validCount.toDouble()) - meanD * meanD),
+  );
+
+  // Порог адаптивной бинаризации (гарантированно выше уровня фонового шума JPEG!)
+  double adaptiveThresh = math.max(
+    2.25 - sensitivity * 0.90,
+    meanD + stdD * (2.55 - sensitivity * 1.15),
+  );
+
+  int effMinR = minR.clamp(4, 24);
+  int effMaxR = maxR.clamp(effMinR + 2, 34);
+
+  if (learnedProfile != null) {
+    adaptiveThresh = math.max(
+      1.55,
+      learnedProfile.targetContrast * (0.72 - (sensitivity - 0.5) * 0.25),
+    );
+    effMinR = learnedProfile.minRadiusPx.clamp(4, 26);
+    effMaxR = learnedProfile.maxRadiusPx.clamp(effMinR + 2, 36);
+  }
+
+  // 3. Бинаризация + Морфологическое замыкание + Заливка полостей капсул
+  final Uint8List rawBin = Uint8List(numPixels);
+  for (int p = 0; p < numPixels; p++) {
+    if (safeMask[p] == 1 && diffMap[p] >= adaptiveThresh) {
+      rawBin[p] = 1;
     }
   }
 
-  final double meanSig = sumSig / validCount.toDouble();
-  final double stdSig = math.sqrt(
-    math.max(0.0, (sumSigSq / validCount.toDouble()) - meanSig * meanSig),
-  );
-
-  // Адаптивный порог стенки для полупрозрачных капсул (как в CapsuleCounter)
-  double wallThreshold = math.max(
-    1.15 - sensitivity * 0.45,
-    meanSig + stdSig * (1.35 - sensitivity * 0.65),
-  );
-
-  int effMinR = minR.clamp(4, 26);
-  int effMaxR = maxR.clamp(effMinR + 1, 34);
-
-  if (learnedProfile != null) {
-    wallThreshold = math.max(
-      0.95,
-      learnedProfile.targetWallSignal * (0.65 - (sensitivity - 0.5) * 0.25),
-    );
-    effMinR = learnedProfile.minRadiusPx.clamp(4, 28);
-    effMaxR = learnedProfile.maxRadiusPx.clamp(effMinR + 1, 36);
-  }
-
-  // 3. Морфологическое выделение и блокировка длинных палочек / волокон / темной грязи
-  final double fiberThresh = math.max(5.5, wallThreshold * 2.6);
-  final Uint8List fiberMask = _buildFiberAndDebrisMask(
-    darkSignal,
+  final Uint8List closedBin = _morphClose3x3(rawBin, safeMask, w, h);
+  final int maxHoleArea = (math.pi * effMaxR * effMaxR * 1.4).round();
+  final Uint8List filledBin = _fillEnclosedCapsuleHoles(
+    closedBin,
     safeMask,
     w,
     h,
-    fiberThresh,
-    effMaxR,
+    maxHoleArea,
   );
 
-  const int numAngles = 12;
-  final List<double> cosTable = List.generate(
-    numAngles,
-    (i) => math.cos(i.toDouble() * 2.0 * math.pi / numAngles.toDouble()),
+  // 4. Анализ связных компонент (Connected Components / Contour Analysis из CapsuleCounter)
+  final Uint8List visited = Uint8List(numPixels);
+  final Int32List queue = Int32List(numPixels);
+  final List<DetectedCapsule> candidates = [];
+
+  final double minSingleArea = math.max(
+    18.0,
+    math.pi * effMinR * effMinR * 0.58,
   );
-  final List<double> sinTable = List.generate(
-    numAngles,
-    (i) => math.sin(i.toDouble() * 2.0 * math.pi / numAngles.toDouble()),
+  final double maxSingleArea = math.pi * effMaxR * effMaxR * 1.45;
+  final double maxClusterArea = maxSingleArea * 4.2;
+
+  const int numVerifyAngles = 12;
+  final List<double> cosT = List.generate(
+    numVerifyAngles,
+    (i) => math.cos(i.toDouble() * 2.0 * math.pi / numVerifyAngles.toDouble()),
+  );
+  final List<double> sinT = List.generate(
+    numVerifyAngles,
+    (i) => math.sin(i.toDouble() * 2.0 * math.pi / numVerifyAngles.toDouble()),
   );
 
-  final List<DetectedCapsule> rawCandidates = [];
-  final List<double> rayPeakSig = List<double>.filled(numAngles, 0.0);
-  final List<int> rayBestR = List<int>.filled(numAngles, 0);
-  final List<double> rayExtSig = List<double>.filled(numAngles, 0.0);
+  for (int i = 0; i < numPixels; i++) {
+    if (filledBin[i] == 0 || visited[i] == 1) continue;
 
-  // 4. Поиск кольцевых и овальных капсул (включая слипшиеся в гроздьях и восьмерках)
-  for (int cyCurr = effMaxR + 6; cyCurr < h - effMaxR - 6; cyCurr++) {
-    for (int cxCurr = effMaxR + 6; cxCurr < w - effMaxR - 6; cxCurr++) {
-      final int centerIdx = cyCurr * w + cxCurr;
-      if (safeMask[centerIdx] == 0 || fiberMask[centerIdx] == 1) continue;
+    int head = 0;
+    int tail = 0;
+    queue[tail++] = i;
+    visited[i] = 1;
 
-      final double centerSig =
-          (darkSignal[centerIdx] * 2.0 +
-              darkSignal[centerIdx - 1] +
-              darkSignal[centerIdx + 1] +
-              darkSignal[centerIdx - w] +
-              darkSignal[centerIdx + w]) /
-          6.0;
+    int minX = i % w;
+    int maxX = minX;
+    int minY = i ~/ w;
+    int maxY = minY;
+    double sumX = 0.0;
+    double sumY = 0.0;
+    double sumDiffInBlob = 0.0;
+    int perimeterCount = 0;
 
-      // Центр прозрачной капсулы не должен быть слишком темным пятном
-      if (centerSig > fiberThresh * 0.85) continue;
+    while (head < tail) {
+      final int curr = queue[head++];
+      final int px = curr % w;
+      final int py = curr ~/ w;
 
-      double bestRScore = -1.0;
-      double bestRNorm = effMinR.toDouble() / w.toDouble();
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
 
-      for (int r = effMinR; r <= effMaxR; r++) {
-        final double rD = r.toDouble();
-        // Эластичный пояс ±25% позволяет находить овальные и деформированные капсулы
-        final int rStart = math.max(3, (rD * 0.78).round());
-        final int rEnd = math.min(effMaxR + 3, (rD * 1.22).round());
+      sumX += px.toDouble();
+      sumY += py.toDouble();
+      sumDiffInBlob += diffMap[curr];
 
-        bool hitsFiber = false;
-        int activeWallRays = 0;
-        int hollowRays = 0;
-        double sumGrad = 0.0;
-        double sumRadius = 0.0;
+      bool isBorder = false;
+      if (px <= 1 ||
+          px >= w - 2 ||
+          py <= 1 ||
+          py >= h - 2 ||
+          filledBin[curr - 1] == 0 ||
+          filledBin[curr + 1] == 0 ||
+          filledBin[curr - w] == 0 ||
+          filledBin[curr + w] == 0) {
+        isBorder = true;
+      }
+      if (isBorder) perimeterCount++;
 
-        for (int a = 0; a < numAngles; a++) {
-          final double ca = cosTable[a];
-          final double sa = sinTable[a];
-
-          double maxS = -1.0;
-          double maxG = 0.0;
-          int bestRR = r;
-
-          for (int rr = rStart; rr <= rEnd; rr++) {
-            final int px = (cxCurr.toDouble() + rr.toDouble() * ca).round();
-            final int py = (cyCurr.toDouble() + rr.toDouble() * sa).round();
-            final int pIdx = py * w + px;
-
-            if (fiberMask[pIdx] == 1) {
-              hitsFiber = true;
-              break;
-            }
-
-            final double s = darkSignal[pIdx] + gradMag[pIdx] * 0.30;
-            if (s > maxS) {
-              maxS = s;
-              maxG = gradMag[pIdx];
-              bestRR = rr;
-            }
+      for (int dy = -1; dy <= 1; dy++) {
+        final int ny = py + dy;
+        if (ny <= 1 || ny >= h - 1) continue;
+        for (int dx = -1; dx <= 1; dx++) {
+          final int nx = px + dx;
+          if (nx <= 1 || nx >= w - 1) continue;
+          final int nIdx = ny * w + nx;
+          if (filledBin[nIdx] == 1 && visited[nIdx] == 0) {
+            visited[nIdx] = 1;
+            queue[tail++] = nIdx;
           }
-
-          if (hitsFiber) break;
-
-          rayPeakSig[a] = maxS;
-          rayBestR[a] = bestRR;
-          sumGrad += maxG;
-          sumRadius += bestRR.toDouble();
-
-          if (maxS >= wallThreshold * 0.78) {
-            activeWallRays++;
-          }
-          if (maxS > centerSig + wallThreshold * 0.28) {
-            hollowRays++;
-          }
-
-          final double rOut = bestRR.toDouble() + 3.0;
-          final int ox = (cxCurr.toDouble() + rOut * ca).round().clamp(
-            0,
-            w - 1,
-          );
-          final int oy = (cyCurr.toDouble() + rOut * sa).round().clamp(
-            0,
-            h - 1,
-          );
-          rayExtSig[a] = darkSignal[oy * w + ox];
-        }
-
-        if (hitsFiber) continue;
-
-        // Для одиночных и слипшихся в гроздья капсул достаточно 7 активных лучей из 12
-        final int minRequiredRays = (8.0 - sensitivity * 2.5).round().clamp(
-          6,
-          8,
-        );
-        if (activeWallRays < minRequiredRays || hollowRays < minRequiredRays) {
-          continue;
-        }
-
-        // Проверяем, что хотя бы в 3 из 4 квадрантов (или во всех 4 со смягченным порогом) есть стенка
-        final double qTop =
-            (rayPeakSig[0] + rayPeakSig[1] + rayPeakSig[11]) / 3.0;
-        final double qRight =
-            (rayPeakSig[2] + rayPeakSig[3] + rayPeakSig[4]) / 3.0;
-        final double qBottom =
-            (rayPeakSig[5] + rayPeakSig[6] + rayPeakSig[7]) / 3.0;
-        final double qLeft =
-            (rayPeakSig[8] + rayPeakSig[9] + rayPeakSig[10]) / 3.0;
-
-        int activeQuadrants = 0;
-        if (qTop >= wallThreshold * 0.65) activeQuadrants++;
-        if (qRight >= wallThreshold * 0.65) activeQuadrants++;
-        if (qBottom >= wallThreshold * 0.65) activeQuadrants++;
-        if (qLeft >= wallThreshold * 0.65) activeQuadrants++;
-        if (activeQuadrants < 3) continue;
-
-        final List<double> sortedRing = List<double>.from(rayPeakSig)..sort();
-        final double medianRing = (sortedRing[5] + sortedRing[6]) * 0.5;
-        if (medianRing < wallThreshold * 0.80) continue;
-
-        // Внешний фон: берем 7 самых светлых внешних направлений из 12 (чтобы видеть капсулы в гроздьях!)
-        final List<double> sortedExt = List<double>.from(rayExtSig)..sort();
-        double freeExtSum = 0.0;
-        for (int k = 0; k < 7; k++) {
-          freeExtSum += sortedExt[k];
-        }
-        final double meanFreeExt = freeExtSum / 7.0;
-
-        if (meanFreeExt > medianRing * 0.78) continue;
-
-        final double hollowDiff = math.max(0.0, medianRing - centerSig);
-        final double extDiff = math.max(0.0, medianRing - meanFreeExt);
-
-        final double score =
-            (hollowDiff * 4.5) +
-            (extDiff * 4.0) +
-            (sumGrad / numAngles.toDouble()) * 0.6 +
-            (activeWallRays.toDouble() * 1.6) +
-            (activeQuadrants == 4 ? 4.0 : 0.0);
-
-        if (score > bestRScore) {
-          bestRScore = score;
-          bestRNorm = (sumRadius / numAngles.toDouble()) / w.toDouble();
         }
       }
+    }
 
-      final double minAcceptScore = (11.5 - sensitivity * 3.5).clamp(7.5, 13.0);
-      if (bestRScore >= minAcceptScore) {
-        rawCandidates.add(
+    final double area = tail.toDouble();
+    // Отбрасываем мелкий шум и огромные артефакты
+    if (area < minSingleArea || area > maxClusterArea) continue;
+
+    final double meanX = sumX / area;
+    final double meanY = sumY / area;
+
+    // Центральные моменты инерции для вычисления соотношения осей (Elongation)
+    double mu20 = 0.0;
+    double mu02 = 0.0;
+    double mu11 = 0.0;
+    for (int k = 0; k < tail; k++) {
+      final int idx = queue[k];
+      final double dx = (idx % w).toDouble() - meanX;
+      final double dy = (idx ~/ w).toDouble() - meanY;
+      mu20 += dx * dx;
+      mu02 += dy * dy;
+      mu11 += dx * dy;
+    }
+    mu20 /= area;
+    mu02 /= area;
+    mu11 /= area;
+
+    final double diffMu = mu20 - mu02;
+    final double root = math.sqrt(diffMu * diffMu + 4.0 * mu11 * mu11);
+    final double lambda1 = math.max(0.1, (mu20 + mu02 + root) * 0.5);
+    final double lambda2 = math.max(0.1, (mu20 + mu02 - root) * 0.5);
+    final double axisRatio = math.sqrt(lambda1 / lambda2);
+
+    final double perim = math.max(1.0, perimeterCount.toDouble());
+    final double circularity = (4.0 * math.pi * area) / (perim * perim);
+    final int boxW = maxX - minX + 1;
+    final int boxH = maxY - minY + 1;
+    final double fillExtent = area / (boxW * boxH).toDouble();
+
+    // ГЕОМЕТРИЧЕСКИЙ ФИЛЬТР ПАЛОЧЕК И ВОЛОКОН:
+    // У палочки или ворсинки высокая вытянутость (axisRatio > 2.35) и низкая округлость (circularity < 0.25)
+    if (axisRatio > 2.45 && circularity < 0.34) continue;
+    if (circularity < 0.18 || fillExtent < 0.26) continue;
+
+    // Внутренняя функция проверки, что кандидат действительно имеет кольцевой/капсульный профиль
+    bool verifyCapsuleCandidate(double candX, double candY, double candR) {
+      final int icx = candX.round().clamp(8, w - 9);
+      final int icy = candY.round().clamp(8, h - 9);
+      final double centerVal = diffMap[icy * w + icx];
+
+      int wallRays = 0;
+      double ringSum = 0.0;
+      double extSum = 0.0;
+
+      for (int a = 0; a < numVerifyAngles; a++) {
+        final double ca = cosT[a];
+        final double sa = sinT[a];
+
+        double bestRay = 0.0;
+        for (double dr = -1.0; dr <= 1.0; dr += 1.0) {
+          final double rr = (candR + dr).clamp(3.0, 36.0);
+          final int px = (candX + rr * ca).round().clamp(0, w - 1);
+          final int py = (candY + rr * sa).round().clamp(0, h - 1);
+          final double v = diffMap[py * w + px];
+          if (v > bestRay) bestRay = v;
+        }
+        ringSum += bestRay;
+        if (bestRay >= adaptiveThresh * 0.72) wallRays++;
+
+        final double rExt = candR + 3.0;
+        final int ox = (candX + rExt * ca).round().clamp(0, w - 1);
+        final int oy = (candY + rExt * sa).round().clamp(0, h - 1);
+        extSum += diffMap[oy * w + ox];
+      }
+
+      final double meanRing = ringSum / numVerifyAngles.toDouble();
+      final double meanExt = extSum / numVerifyAngles.toDouble();
+
+      // У реальной капсулы стенка выражена минимум в 7 из 12 направлений и заметно контрастнее фона и центра
+      if (wallRays < 7) return false;
+      if (meanRing < adaptiveThresh * 0.80) return false;
+      if (centerVal > meanRing * 1.15 && meanRing > adaptiveThresh * 2.2) {
+        // Сплошная черная точка грязи без светлой полости внутри
+        return false;
+      }
+      if (meanExt > meanRing * 0.85) return false;
+      return true;
+    }
+
+    // СЛУЧАЙ А: Одиночная круглая или слегка овальная капсула
+    if (area <= maxSingleArea && axisRatio <= 1.90 && circularity >= 0.32) {
+      final double eqR = math
+          .sqrt(area / math.pi)
+          .clamp(effMinR.toDouble(), effMaxR.toDouble());
+      if (verifyCapsuleCandidate(meanX, meanY, eqR)) {
+        candidates.add(
           DetectedCapsule(
-            cxNorm: cxCurr.toDouble() / w.toDouble(),
-            cyNorm: cyCurr.toDouble() / h.toDouble(),
-            rNorm: bestRNorm,
-            score: bestRScore,
+            cxNorm: meanX / w.toDouble(),
+            cyNorm: meanY / h.toDouble(),
+            rNorm: eqR / w.toDouble(),
+            score: (sumDiffInBlob / area) * circularity * 20.0,
           ),
         );
       }
     }
+    // СЛУЧАЙ Б: Слипшаяся пара («восьмерка») или цепочка из 2–3 капсул
+    else if (area > minSingleArea * 1.55 && axisRatio <= 3.1) {
+      final int estimatedCount =
+          (area / (math.pi * math.pow((effMinR + effMaxR) * 0.45, 2)))
+              .round()
+              .clamp(2, 3);
+      final double angle = 0.5 * math.atan2(2.0 * mu11, mu20 - mu02);
+      final double cosA = math.cos(angle);
+      final double sinA = math.sin(angle);
+      final double majorHalfLen = math.sqrt(lambda1) * 1.65;
+      final double subR = math
+          .sqrt((area / estimatedCount.toDouble()) / math.pi)
+          .clamp(effMinR.toDouble(), effMaxR.toDouble());
+
+      for (int cIdx = 0; cIdx < estimatedCount; cIdx++) {
+        final double frac = (estimatedCount == 1)
+            ? 0.0
+            : (-0.55 +
+                  1.10 * (cIdx.toDouble() / (estimatedCount - 1).toDouble()));
+        final double subX = meanX + frac * majorHalfLen * cosA;
+        final double subY = meanY + frac * majorHalfLen * sinA;
+
+        if (verifyCapsuleCandidate(subX, subY, subR)) {
+          candidates.add(
+            DetectedCapsule(
+              cxNorm: subX / w.toDouble(),
+              cyNorm: subY / h.toDouble(),
+              rNorm: subR / w.toDouble(),
+              score: (sumDiffInBlob / area) * 14.0,
+            ),
+          );
+        }
+      }
+    }
   }
 
-  // 5. Подавление перекрытий (NMS): сохраняет соприкасающиеся капсулы в цепочках и восьмерках
-  rawCandidates.sort((a, b) => b.score.compareTo(a.score));
+  // 5. Немаксимальное подавление (NMS)
+  candidates.sort((a, b) => b.score.compareTo(a.score));
   final List<DetectedCapsule> accepted = [];
   final double aspect = h.toDouble() / w.toDouble();
 
-  for (final cand in rawCandidates) {
+  for (final cand in candidates) {
     bool overlaps = false;
     for (final ex in accepted) {
       final double dx = cand.cxNorm - ex.cxNorm;
       final double dy = (cand.cyNorm - ex.cyNorm) * aspect;
       final double dist = math.sqrt(dx * dx + dy * dy);
-      final double minAllowedDist = (cand.rNorm + ex.rNorm) * 0.68;
-      if (dist < minAllowedDist) {
+      if (dist < (cand.rNorm + ex.rNorm) * 0.72) {
         overlaps = true;
         break;
       }
@@ -846,7 +847,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Interpreter? _tfliteInterpreter;
   bool _isTfliteLoaded = false;
-  bool _useAiModel = true;
+  String _tfliteStatusMessage = 'Инициализация...';
+  // По умолчанию включен проверенный алгоритм CapsuleCounter (можно переключить на ИИ кнопкой)
+  bool _useAiModel = false;
 
   Uint8List? _loadedImageBytes;
   int _loadedImageWidth = 1080;
@@ -910,7 +913,7 @@ class _CameraScreenState extends State<CameraScreen> {
   String _multiSharpnessInput = '1.0 1.5 2.0';
   int _minCapsuleRadiusPx = 4;
   int _maxCapsuleRadiusPx = 14;
-  double _detectionSensitivity = 0.60;
+  double _detectionSensitivity = 0.55;
 
   @override
   void initState() {
@@ -922,51 +925,45 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // Безопасная инициализация TFLite с обязательным вызовом allocateTensors()
+  // Надежная загрузка модели через rootBundle.load + Interpreter.fromBuffer
+  // (Работает и в Debug, и в Release APK независимо от сжатия ассетов)
   Future<void> _initTfliteModel() async {
     try {
-      final options = InterpreterOptions()..threads = 4;
-      Interpreter? interpreter;
+      ByteData? rawAsset;
       try {
-        interpreter = await Interpreter.fromAsset(
-          'assets/capsule_detector.tflite',
-          options: options,
-        );
+        rawAsset = await rootBundle.load('assets/capsule_detector.tflite');
       } catch (_) {
-        interpreter = await Interpreter.fromAsset(
-          'capsule_detector.tflite',
-          options: options,
-        );
+        rawAsset = await rootBundle.load('capsule_detector.tflite');
       }
 
+      final Uint8List modelBytes = rawAsset.buffer.asUint8List(
+        rawAsset.offsetInBytes,
+        rawAsset.lengthInBytes,
+      );
+
+      final options = InterpreterOptions()..threads = 2;
+      final interpreter = Interpreter.fromBuffer(modelBytes, options: options);
       interpreter.allocateTensors();
 
       if (mounted) {
         setState(() {
           _tfliteInterpreter = interpreter;
           _isTfliteLoaded = true;
-          _useAiModel = true;
+          _tfliteStatusMessage = 'YOLOv8 подключена';
         });
       }
-      debugPrint(
-        'YOLOv8 TFLite готова! Вход: ${interpreter.getInputTensor(0).shape} (${interpreter.getInputTensor(0).type}), '
-        'Выход: ${interpreter.getOutputTensor(0).shape} (${interpreter.getOutputTensor(0).type})',
-      );
     } catch (e) {
-      debugPrint('Модель TFLite не загружена (используется алгоритм): $e');
+      debugPrint('Статус загрузки TFLite: $e');
       if (mounted) {
         setState(() {
           _isTfliteLoaded = false;
           _useAiModel = false;
+          _tfliteStatusMessage = '$e';
         });
       }
     }
   }
 
-  // ==========================================================================
-  // БЕЗОПАСНЫЙ ЗАПУСК НЕЙРОСЕТИ YOLOv8 ЧЕРЕЗ ПРЯМОЙ БУФЕР ТЕНЗОРОВ
-  // (Исключает ошибку "Bad state: failed precondition")
-  // ==========================================================================
   List<DetectedCapsule> _runYoloTfliteSinglePass({
     required Uint8List srcRgba,
     required int srcW,
@@ -979,14 +976,12 @@ class _CameraScreenState extends State<CameraScreen> {
     final interpreter = _tfliteInterpreter;
     if (interpreter == null) return [];
 
-    // Гарантируем, что тензоры аллоцированы перед записью
     interpreter.allocateTensors();
 
     final Tensor inTensor = interpreter.getInputTensor(0);
     final Tensor outTensor = interpreter.getOutputTensor(0);
 
     final List<int> inShape = inTensor.shape;
-    // Определяем формат входа: NCHW [1, 3, 640, 640] или NHWC [1, 640, 640, 3]
     final bool isInputNchw = inShape.length == 4 && inShape[1] == 3;
     final int modelH = isInputNchw
         ? inShape[2]
@@ -1020,7 +1015,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
     final int planeSize = modelW * modelH;
 
-    // Прямое масштабирование из рабочей матрицы srcRgba в размер входа нейросети
     for (int y = 0; y < modelH; y++) {
       final int sy = ((y * srcH) ~/ modelH).clamp(0, srcH - 1);
       for (int x = 0; x < modelW; x++) {
@@ -1072,18 +1066,15 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    // Упаковываем входной буфер точно под размер байтов входного тензора (Float32 / Float16 / Uint8)
     final int inBytesLen = inTensor.numBytes();
     final Uint8List rawInputBytes = Uint8List(inBytesLen);
 
     if (inBytesLen == totalInElements * 4) {
-      // Float32
       rawInputBytes.buffer.asUint8List().setAll(
         0,
         rgbNormalized.buffer.asUint8List(),
       );
     } else if (inBytesLen == totalInElements * 2) {
-      // Float16 (если экспортировано с half=True)
       final ByteData bd = ByteData.sublistView(rawInputBytes);
       for (int i = 0; i < totalInElements; i++) {
         bd.setUint16(
@@ -1092,23 +1083,15 @@ class _CameraScreenState extends State<CameraScreen> {
           Endian.little,
         );
       }
-    } else if (inBytesLen == totalInElements) {
-      // Uint8
-      for (int i = 0; i < totalInElements; i++) {
-        rawInputBytes[i] = (rgbNormalized[i] * 255.0).round().clamp(0, 255);
-      }
     } else {
       final Uint8List fBytes = rgbNormalized.buffer.asUint8List();
-      final int copyLen = math.min(inBytesLen, fBytes.length);
-      rawInputBytes.setRange(0, copyLen, fBytes);
+      rawInputBytes.setRange(0, math.min(inBytesLen, fBytes.length), fBytes);
     }
 
-    // Копируем байты напрямую в нативный тензор и вызываем invoke()
     inTensor.data = rawInputBytes;
     interpreter.invoke();
     final Uint8List rawOutBytes = Uint8List.fromList(outTensor.data);
 
-    // Декодируем выходной тензор (поддерживаем и Float32, и Float16)
     final List<int> outShape = outTensor.shape;
     int totalOutElements = 1;
     for (final dim in outShape) {
@@ -1132,17 +1115,16 @@ class _CameraScreenState extends State<CameraScreen> {
 
     final int dim1 = outShape.length >= 3 ? outShape[1] : 5;
     final int dim2 = outShape.length >= 3 ? outShape[2] : 8400;
-    final bool isChannelsFirst = dim1 < dim2; // [1, 5, 8400] vs [1, 8400, 5]
+    final bool isChannelsFirst = dim1 < dim2;
     final int numAnchors = isChannelsFirst ? dim2 : dim1;
     final int numChannels = isChannelsFirst ? dim1 : dim2;
 
-    // Для моделей, обученных на малых выборках, порог уверенности делается адаптивным
-    final double confThreshold = (0.32 - sensitivity * 0.26).clamp(0.06, 0.50);
+    final double confThreshold = (0.42 - sensitivity * 0.30).clamp(0.15, 0.55);
 
     final double aspect = srcH.toDouble() / math.max(1.0, srcW.toDouble());
     final double roiCx = _gridCenterXNorm;
     final double roiCy = _gridCenterYNorm;
-    final double roiMaxR = _gridRadiusNorm * 0.92;
+    final double roiMaxR = _gridRadiusNorm * 0.90;
 
     final List<DetectedCapsule> rawDetections = [];
 
@@ -1194,7 +1176,7 @@ class _CameraScreenState extends State<CameraScreen> {
       }
       if (inBannedZone) continue;
 
-      final double rNorm = ((w + h) / 4.0).clamp(0.004, 0.065);
+      final double rNorm = ((w + h) / 4.0).clamp(0.004, 0.055);
 
       rawDetections.add(
         DetectedCapsule(
@@ -1215,8 +1197,7 @@ class _CameraScreenState extends State<CameraScreen> {
         final double dx = cand.cxNorm - ex.cxNorm;
         final double dy = (cand.cyNorm - ex.cyNorm) * aspect;
         final double dist = math.sqrt(dx * dx + dy * dy);
-        final double minAllowedDist = (cand.rNorm + ex.rNorm) * 0.68;
-        if (dist < minAllowedDist) {
+        if (dist < (cand.rNorm + ex.rNorm) * 0.72) {
           overlaps = true;
           break;
         }
@@ -1239,19 +1220,15 @@ class _CameraScreenState extends State<CameraScreen> {
       });
     }
 
-    final double? wallSig = prefs.getDouble('learned_wall_sig');
-    final double? hollowDiff = prefs.getDouble('learned_hollow_diff');
-    final double? maxSpike = prefs.getDouble('learned_max_spike');
-    final int? minR = prefs.getInt('learned_min_r');
-    final int? maxR = prefs.getInt('learned_max_r');
-    final int? trainCnt = prefs.getInt('learned_train_count');
+    final double? targetContrast = prefs.getDouble('cc_learned_contrast');
+    final int? minR = prefs.getInt('cc_learned_min_r');
+    final int? maxR = prefs.getInt('cc_learned_max_r');
+    final int? trainCnt = prefs.getInt('cc_learned_train_count');
 
-    if (wallSig != null && hollowDiff != null && minR != null && maxR != null) {
+    if (targetContrast != null && minR != null && maxR != null) {
       setState(() {
         _learnedProfile = LearnedCapsuleProfile(
-          targetWallSignal: wallSig,
-          targetHollowDiff: hollowDiff,
-          maxAllowedSpike: maxSpike ?? 14.0,
+          targetContrast: targetContrast,
           minRadiusPx: minR,
           maxRadiusPx: maxR,
           trainingCount: trainCnt ?? 1,
@@ -1538,7 +1515,7 @@ class _CameraScreenState extends State<CameraScreen> {
       rawLum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
     }
 
-    final Float32List localBg = _computeBoxBlur(rawLum, w, h, 16);
+    final Float32List localBg = _computeBoxBlur(rawLum, w, h, 15);
     final Float32List darkSig = Float32List(numPixels);
     for (int i = 0; i < numPixels; i++) {
       final double d = localBg[i] - rawLum[i];
@@ -1722,8 +1699,6 @@ class _CameraScreenState extends State<CameraScreen> {
     );
 
     double sumWallSig = 0.0;
-    double sumHollowDiff = 0.0;
-    double maxObservedCapsulePeak = 0.0;
     int minR = 999;
     int maxR = 0;
     int sampleCount = 0;
@@ -1733,9 +1708,8 @@ class _CameraScreenState extends State<CameraScreen> {
       final int cy = (c.cyNorm * h.toDouble()).round().clamp(10, h - 11);
       final int r = (c.rNorm * w.toDouble()).round().clamp(3, 30);
 
-      final double centerSig = darkSig[cy * w + cx];
-      final int rStart = math.max(3, (r.toDouble() * 0.75).round());
-      final int rEnd = math.min(34, (r.toDouble() * 1.25).round());
+      final int rStart = math.max(3, (r.toDouble() * 0.78).round());
+      final int rEnd = math.min(34, (r.toDouble() * 1.22).round());
 
       double ringPeakSum = 0.0;
       for (int a = 0; a < numAngles; a++) {
@@ -1755,14 +1729,9 @@ class _CameraScreenState extends State<CameraScreen> {
           if (s > rayMax) rayMax = s;
         }
         ringPeakSum += rayMax;
-        if (rayMax > maxObservedCapsulePeak) {
-          maxObservedCapsulePeak = rayMax;
-        }
       }
 
-      final double meanRingPeak = ringPeakSum / numAngles.toDouble();
-      sumWallSig += meanRingPeak;
-      sumHollowDiff += math.max(0.5, meanRingPeak - centerSig);
+      sumWallSig += ringPeakSum / numAngles.toDouble();
       if (r < minR) minR = r;
       if (r > maxR) maxR = r;
       sampleCount++;
@@ -1770,35 +1739,26 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (sampleCount == 0) return;
 
-    double learnedWall = (sumWallSig / sampleCount.toDouble()).clamp(1.1, 14.0);
-    double learnedHollow = (sumHollowDiff / sampleCount.toDouble()).clamp(
-      0.5,
+    final double learnedContrast = (sumWallSig / sampleCount.toDouble()).clamp(
+      1.6,
       12.0,
     );
-    double learnedMaxSpike = math
-        .max(8.0, maxObservedCapsulePeak * 1.55)
-        .clamp(8.0, 22.0);
-
-    final int learnedMinR = (minR - 1).clamp(3, 26);
-    final int learnedMaxR = (maxR + 2).clamp(learnedMinR + 1, 34);
+    final int learnedMinR = (minR - 1).clamp(4, 26);
+    final int learnedMaxR = (maxR + 2).clamp(learnedMinR + 2, 34);
     final int nextTrainCount = (_learnedProfile?.trainingCount ?? 0) + 1;
 
     final profile = LearnedCapsuleProfile(
-      targetWallSignal: learnedWall,
-      targetHollowDiff: learnedHollow,
-      maxAllowedSpike: learnedMaxSpike,
+      targetContrast: learnedContrast,
       minRadiusPx: learnedMinR,
       maxRadiusPx: learnedMaxR,
       trainingCount: nextTrainCount,
     );
 
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('learned_wall_sig', profile.targetWallSignal);
-    await prefs.setDouble('learned_hollow_diff', profile.targetHollowDiff);
-    await prefs.setDouble('learned_max_spike', profile.maxAllowedSpike);
-    await prefs.setInt('learned_min_r', profile.minRadiusPx);
-    await prefs.setInt('learned_max_r', profile.maxRadiusPx);
-    await prefs.setInt('learned_train_count', profile.trainingCount);
+    await prefs.setDouble('cc_learned_contrast', profile.targetContrast);
+    await prefs.setInt('cc_learned_min_r', profile.minRadiusPx);
+    await prefs.setInt('cc_learned_max_r', profile.maxRadiusPx);
+    await prefs.setInt('cc_learned_train_count', profile.trainingCount);
 
     final List<DetectedCapsule> userVerifiedCapsules = _capsules
         .map((c) => c.copyWith(isManual: true))
@@ -1821,7 +1781,49 @@ class _CameraScreenState extends State<CameraScreen> {
         SnackBar(
           backgroundColor: Colors.deepPurple.shade700,
           content: Text(
-            'Обучение #$nextTrainCount применено! Эталонов: $sampleCount, всего найдено: ${_capsules.length} шт.',
+            'Обучение #$nextTrainCount сохранено! R: $learnedMinR–$learnedMaxR px, всего капсул: ${_capsules.length} шт.',
+          ),
+        ),
+      );
+    }
+  }
+
+  // Переключение между чистым алгоритмом CapsuleCounter и гибридным ИИ-режимом
+  Future<void> _toggleDetectionEngineMode() async {
+    if (!_isTfliteLoaded) {
+      await _initTfliteModel();
+    }
+
+    if (!_isTfliteLoaded) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: Colors.orange.shade900,
+            duration: const Duration(seconds: 3),
+            content: Text(
+              'Активен алгоритм CapsuleCounter v1.6. Нативный модуль TFLite недоступен на этом устройстве ($_tfliteStatusMessage).',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    setState(() {
+      _useAiModel = !_useAiModel;
+    });
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 2),
+          backgroundColor: _useAiModel
+              ? Colors.green.shade800
+              : Colors.blueGrey.shade800,
+          content: Text(
+            _useAiModel
+                ? 'Включен режим: ИИ YOLOv8 + CapsuleCounter'
+                : 'Включен режим: Алгоритм CapsuleCounter v1.6',
           ),
         ),
       );
@@ -1974,9 +1976,6 @@ class _CameraScreenState extends State<CameraScreen> {
     return null;
   }
 
-  // ==========================================================================
-  // ЕДИНЫЙ ЗАПУСК РАСПОЗНАВАНИЯ: ГИБРИДНЫЙ ИИ YOLOv8 + CAPSULECOUNTER АЛГОРИТМ
-  // ==========================================================================
   Future<void> _runCapsuleDetection({
     required List<double> brightnessValues,
     required List<double> sharpnessValues,
@@ -2010,7 +2009,6 @@ class _CameraScreenState extends State<CameraScreen> {
         bannedZonesNorm: List<Offset>.from(_bannedNoiseZonesNorm),
       );
 
-      // Запускаем контурно-морфологический детектор CapsuleCounter в Isolate
       final MultiPassResult algoResult = await compute(
         _runMultiPassIsolate,
         task,
@@ -2020,7 +2018,6 @@ class _CameraScreenState extends State<CameraScreen> {
       final double aspect =
           _cachedWorkH.toDouble() / math.max(1.0, _cachedWorkW.toDouble());
 
-      // Если включен режим ИИ (YOLOv8 TFLite), запускаем нейросеть и объединяем с контурами
       if (_isTfliteLoaded && _useAiModel && _tfliteInterpreter != null) {
         try {
           final List<SinglePassSummary> aiPasses = [];
@@ -2037,23 +2034,22 @@ class _CameraScreenState extends State<CameraScreen> {
               sensitivity: _detectionSensitivity,
             );
 
-            // Гибридное слияние: берем боксы нейросети YOLOv8 и дополняем контурами CapsuleCounter
             final List<DetectedCapsule> combined = List<DetectedCapsule>.from(
-              yoloCaps,
+              p.capsules,
             );
-            for (final ac in p.capsules) {
+            for (final yc in yoloCaps) {
               bool exists = false;
-              for (final yc in combined) {
+              for (final ac in combined) {
                 final double dx = ac.cxNorm - yc.cxNorm;
                 final double dy = (ac.cyNorm - yc.cyNorm) * aspect;
                 if (math.sqrt(dx * dx + dy * dy) <
-                    (ac.rNorm + yc.rNorm) * 0.72) {
+                    (ac.rNorm + yc.rNorm) * 0.75) {
                   exists = true;
                   break;
                 }
               }
               if (!exists) {
-                combined.add(ac);
+                combined.add(yc);
               }
             }
 
@@ -2100,9 +2096,7 @@ class _CameraScreenState extends State<CameraScreen> {
             );
           }
         } catch (aiErr) {
-          debugPrint(
-            'Предупреждение TFLite (использован контурный расчет): $aiErr',
-          );
+          debugPrint('Предупреждение TFLite: $aiErr');
         }
       }
 
@@ -2146,8 +2140,8 @@ class _CameraScreenState extends State<CameraScreen> {
       final stats = _getDiameterStatsMicrons();
       final bool isMulti = finalResult.passes.length > 1;
       final String modeLabel = (_isTfliteLoaded && _useAiModel)
-          ? 'ИИ YOLOv8'
-          : 'Алгоритм';
+          ? 'ИИ + CapsuleCounter'
+          : 'CapsuleCounter v1.6';
 
       if (preservedManualCapsules == null) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -2213,7 +2207,7 @@ class _CameraScreenState extends State<CameraScreen> {
         builder: (context, setDialogState) {
           return AlertDialog(
             title: const Text(
-              'Мульти-расчет капсул',
+              'Параметры CapsuleCounter',
               style: TextStyle(fontSize: 17),
             ),
             content: SingleChildScrollView(
@@ -2222,14 +2216,14 @@ class _CameraScreenState extends State<CameraScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    'Укажите несколько значений через пробел:',
+                    'Значения для мульти-прохода (через пробел):',
                     style: TextStyle(fontSize: 12, color: Colors.white70),
                   ),
                   const SizedBox(height: 10),
                   TextField(
                     controller: bCtrl,
                     decoration: const InputDecoration(
-                      labelText: 'Значения Яркости (через пробел)',
+                      labelText: 'Значения Яркости',
                       hintText: '-0.5 0.0 0.5',
                       border: OutlineInputBorder(),
                       isDense: true,
@@ -2239,7 +2233,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   TextField(
                     controller: sCtrl,
                     decoration: const InputDecoration(
-                      labelText: 'Значения Четкости (через пробел)',
+                      labelText: 'Значения Четкости',
                       hintText: '1.0 1.5 2.0',
                       border: OutlineInputBorder(),
                       isDense: true,
@@ -2268,7 +2262,7 @@ class _CameraScreenState extends State<CameraScreen> {
                     },
                   ),
                   Text(
-                    'Чувствительность (ИИ / контуры): ${(tempSens * 100.0).round()}%',
+                    'Порог чувствительности (Threshold): ${(tempSens * 100.0).round()}%',
                     style: const TextStyle(fontSize: 12),
                   ),
                   Slider(
@@ -2302,8 +2296,8 @@ class _CameraScreenState extends State<CameraScreen> {
                             onPressed: () async {
                               final prefs =
                                   await SharedPreferences.getInstance();
-                              await prefs.remove('learned_wall_sig');
-                              await prefs.remove('learned_train_count');
+                              await prefs.remove('cc_learned_contrast');
+                              await prefs.remove('cc_learned_train_count');
                               setState(() {
                                 _learnedProfile = null;
                                 _bannedNoiseZonesNorm.clear();
@@ -3246,7 +3240,7 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
 
-            // 2. ПАНЕЛЬ СТАТИСТИКИ, ПЕРЕКЛЮЧАТЕЛЯ НЕЙРОСЕТИ (ИИ) И ПРАВКИ
+            // 2. ПАНЕЛЬ СТАТИСТИКИ И ПОСТОЯННОГО ПЕРЕКЛЮЧАТЕЛЯ РЕЖИМА (CAPSULECOUNTER / ИИ)
             Container(
               width: double.infinity,
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -3292,33 +3286,36 @@ class _CameraScreenState extends State<CameraScreen> {
                       ),
                     ),
                   ),
-                  if (_isTfliteLoaded && !_manualEditCapsules) ...[
+                  // Кнопка переключения режима ВСЕГДА ВИДНА (и в Debug, и в Release)
+                  if (!_manualEditCapsules) ...[
                     InkWell(
-                      onTap: () => setState(() => _useAiModel = !_useAiModel),
+                      onTap: _toggleDetectionEngineMode,
                       child: Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 5,
                           vertical: 3,
                         ),
                         decoration: BoxDecoration(
-                          color: _useAiModel
+                          color: (_isTfliteLoaded && _useAiModel)
                               ? Colors.greenAccent.withOpacity(0.25)
-                              : Colors.white12,
+                              : Colors.cyanAccent.withOpacity(0.18),
                           borderRadius: BorderRadius.circular(4),
                           border: Border.all(
-                            color: _useAiModel
+                            color: (_isTfliteLoaded && _useAiModel)
                                 ? Colors.greenAccent
-                                : Colors.white24,
+                                : Colors.cyanAccent,
                           ),
                         ),
                         child: Text(
-                          _useAiModel ? 'ИИ: ВКЛ' : 'Алгоритм',
+                          (_isTfliteLoaded && _useAiModel)
+                              ? 'ИИ + Counter'
+                              : 'CapsuleCounter',
                           style: TextStyle(
-                            fontSize: 9.5,
+                            fontSize: 9.2,
                             fontWeight: FontWeight.bold,
-                            color: _useAiModel
+                            color: (_isTfliteLoaded && _useAiModel)
                                 ? Colors.greenAccent
-                                : Colors.white70,
+                                : Colors.cyanAccent,
                           ),
                         ),
                       ),
@@ -4040,7 +4037,7 @@ class _CameraScreenState extends State<CameraScreen> {
                             _manualEditCapsules = false;
                             _minCapsuleRadiusPx = 4;
                             _maxCapsuleRadiusPx = 14;
-                            _detectionSensitivity = 0.60;
+                            _detectionSensitivity = 0.55;
                             _snapBufferDirty = true;
                           });
                         },
