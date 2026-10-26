@@ -1,0 +1,3 @@
+-keep class org.tensorflow.lite.** { *; }
+-keep class com.tfliteflutter.** { *; }
+-dontwarn org.tensorflow.lite.**
